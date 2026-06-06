@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"unicode"
 
 	"github.com/veandco/go-sdl2/sdl"
@@ -955,18 +954,12 @@ func (e *Editor) backspace() {
 		e.recordUndo(op)
 	} else if e.cursorY > 0 {
 		prevLine := e.line(e.cursorY - 1)
-		currentLine := e.line(e.cursorY)
 		deleteOffset := e.positionOffset(Position{x: len(prevLine), y: e.cursorY - 1})
-		// Join with previous line
-		oldPrevLine := append([]rune(nil), prevLine...)
-		oldCurrentLine := append([]rune(nil), currentLine...)
-		joinedLine := append(append([]rune(nil), prevLine...), currentLine...)
 
 		op := UndoOp{
-			deleteAt:     deleteOffset - len(prevLine),
-			deleted:      append(append(oldPrevLine, '\n'), oldCurrentLine...),
-			insertAt:     deleteOffset - len(prevLine),
-			inserted:     joinedLine,
+			deleteAt:     deleteOffset,
+			deleted:      []rune{'\n'},
+			insertAt:     deleteOffset,
 			cursorBefore: Position{x: e.cursorX, y: e.cursorY},
 		}
 
@@ -1001,18 +994,12 @@ func (e *Editor) deleteForward() {
 		e.invalidateMaxLineWidth()
 		e.recordUndo(op)
 	} else if e.cursorY < e.lineCount()-1 {
-		nextLine := e.line(e.cursorY + 1)
 		deleteOffset := e.positionOffset(Position{x: len(line), y: e.cursorY})
-		// Join with next line
-		oldCurrentLine := append([]rune(nil), line...)
-		oldNextLine := append([]rune(nil), nextLine...)
-		joinedLine := append(append([]rune(nil), line...), nextLine...)
 
 		op := UndoOp{
-			deleteAt:     deleteOffset - len(line),
-			deleted:      append(append(oldCurrentLine, '\n'), oldNextLine...),
-			insertAt:     deleteOffset - len(line),
-			inserted:     joinedLine,
+			deleteAt:     deleteOffset,
+			deleted:      []rune{'\n'},
+			insertAt:     deleteOffset,
 			cursorBefore: Position{x: e.cursorX, y: e.cursorY},
 		}
 
@@ -1026,17 +1013,11 @@ func (e *Editor) deleteForward() {
 
 func (e *Editor) newline() {
 	insertOffset := e.positionOffset(Position{x: e.cursorX, y: e.cursorY})
-	line := e.line(e.cursorY)
-
-	oldLine := append([]rune(nil), line...)
-	firstPart := append([]rune(nil), line[:e.cursorX]...)
-	secondPart := append([]rune(nil), line[e.cursorX:]...)
 
 	op := UndoOp{
-		deleteAt:     insertOffset - e.cursorX,
-		deleted:      oldLine,
-		insertAt:     insertOffset - e.cursorX,
-		inserted:     append(append(firstPart, '\n'), secondPart...),
+		deleteAt:     insertOffset,
+		insertAt:     insertOffset,
+		inserted:     []rune{'\n'},
 		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
 	}
 
@@ -1223,6 +1204,7 @@ func (e *Editor) deleteSelection() {
 	e.cursorX = start.x
 	e.cursorY = start.y
 	e.clearSelection()
+	e.invalidateMaxLineWidth()
 
 	e.recordUndo(op)
 }
@@ -2807,9 +2789,7 @@ func main() {
 		}
 
 		cmd := exec.Command(exe, detachedArgs...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true, // Create new session and detach from terminal
-		}
+		configureDetachedCommand(cmd)
 
 		// Start the detached process
 		err = cmd.Start()
