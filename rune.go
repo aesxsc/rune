@@ -73,18 +73,27 @@ type FileState struct {
 	savedAtUndoDepth int
 	dirty            bool
 	untitled         bool
+	lineEnding       string
+	modTime          int64
+	readOnly         bool
 }
 
 type EditorConfig struct {
-	Ignore         []string `json:"ignore"`
-	AutosaveMillis int      `json:"autosave_ms"`
-	BrowserWidth   int      `json:"browser_width"`
+	Ignore          []string          `json:"ignore"`
+	AutosaveMillis  int               `json:"autosave_ms"`
+	BrowserWidth    int               `json:"browser_width"`
+	Keybindings     map[string]string `json:"keybindings"`
+	Theme           map[string]string `json:"theme"`
+	ShowWhitespace  bool              `json:"show_whitespace"`
+	WordWrap        bool              `json:"word_wrap"`
+	ReloadOnChanged bool              `json:"reload_on_changed"`
 }
 
 type SessionState struct {
 	Root        string   `json:"root"`
 	OpenFiles   []string `json:"open_files"`
 	CurrentFile string   `json:"current_file"`
+	RecentFiles []string `json:"recent_files"`
 }
 
 type OverlayMode int
@@ -100,6 +109,11 @@ const (
 	overlayFilter
 	overlaySaveAs
 	overlayReplace
+	overlayFileFinder
+	overlayBuffer
+	overlayGrep
+	overlayDirtyPrompt
+	overlayReloadPrompt
 )
 
 type FileNode struct {
@@ -445,9 +459,13 @@ type Editor struct {
 	untitledName             string
 	untitledCounter          int
 	openFiles                []string
+	recentFiles              []string
 	fileStates               map[string]*FileState
 	isDirty                  bool
 	savedAtUndoDepth         int // Undo stack depth when file was saved (-1 = unreachable)
+	lineEnding               string
+	diskModTime              int64
+	readOnly                 bool
 	fileTree                 *FileNode
 	nodeByPath               map[string]*FileNode
 	flatFileList             []*FileNode
@@ -484,11 +502,21 @@ type Editor struct {
 	overlayMode              OverlayMode
 	overlayTitle             string
 	overlayText              string
+	overlayItems             []string
+	pendingAction            string
+	pendingPath              string
 	fileFilter               string
 	ignoreNames              map[string]bool
 	stateDir                 string
 	autosaveInterval         time.Duration
 	lastAutosave             time.Time
+	keybindings              map[string]string
+	theme                    map[string]sdl.Color
+	showWhitespace           bool
+	wordWrap                 bool
+	reloadOnChanged          bool
+	grepResults              []string
+	matchingBracket          *Position
 }
 
 func NewEditor(rootPath string) (*Editor, error) {
@@ -573,6 +601,12 @@ func NewEditor(rootPath string) (*Editor, error) {
 	if autosaveMillis <= 0 {
 		autosaveMillis = 3000
 	}
+	theme := defaultTheme()
+	for key, value := range config.Theme {
+		if color, ok := parseHexColor(value); ok {
+			theme[key] = color
+		}
+	}
 
 	// Create system cursors
 	arrowCursor := sdl.CreateSystemCursor(sdl.SYSTEM_CURSOR_ARROW)
@@ -606,6 +640,11 @@ func NewEditor(rootPath string) (*Editor, error) {
 		ignoreNames:              ignoreNames,
 		stateDir:                 stateDir,
 		autosaveInterval:         time.Duration(autosaveMillis) * time.Millisecond,
+		keybindings:              config.Keybindings,
+		theme:                    theme,
+		showWhitespace:           config.ShowWhitespace,
+		wordWrap:                 config.WordWrap,
+		reloadOnChanged:          config.ReloadOnChanged,
 	}
 	if w, _, err := font.SizeUTF8("M"); err == nil && w > 0 {
 		editor.charWidth = w
@@ -631,6 +670,126 @@ func loadEditorConfig(root string) EditorConfig {
 		}
 	}
 	return config
+}
+
+func defaultTheme() map[string]sdl.Color {
+	return map[string]sdl.Color{
+		"background": sdl.Color{R: 15, G: 15, B: 15, A: 255},
+		"panel":      sdl.Color{R: 20, G: 20, B: 20, A: 255},
+		"foreground": sdl.Color{R: 200, G: 200, B: 200, A: 255},
+		"muted":      sdl.Color{R: 120, G: 120, B: 120, A: 255},
+		"accent":     sdl.Color{R: 100, G: 160, B: 220, A: 255},
+		"selection":  sdl.Color{R: 50, G: 80, B: 120, A: 255},
+		"comment":    sdl.Color{R: 120, G: 150, B: 120, A: 255},
+		"string":     sdl.Color{R: 210, G: 170, B: 110, A: 255},
+		"number":     sdl.Color{R: 190, G: 150, B: 220, A: 255},
+		"keyword":    sdl.Color{R: 110, G: 170, B: 230, A: 255},
+		"bracket":    sdl.Color{R: 180, G: 120, B: 220, A: 255},
+	}
+}
+
+func parseHexColor(in string) (sdl.Color, bool) {
+	in = strings.TrimPrefix(strings.TrimSpace(in), "#")
+	if len(in) != 6 {
+		return sdl.Color{}, false
+	}
+	value, err := strconv.ParseUint(in, 16, 32)
+	if err != nil {
+		return sdl.Color{}, false
+	}
+	return sdl.Color{R: uint8(value >> 16), G: uint8(value >> 8), B: uint8(value), A: 255}, true
+}
+
+func isBinaryData(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	check := min(len(data), 4096)
+	zeros := 0
+	control := 0
+	for _, b := range data[:check] {
+		if b == 0 {
+			zeros++
+		} else if b < 9 || (b > 13 && b < 32) {
+			control++
+		}
+	}
+	return zeros > 0 || control*8 > check
+}
+
+func detectLineEnding(text []byte) string {
+	if strings.Contains(string(text), "\r\n") {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+func normalizeNewlines(text string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+}
+
+func applyLineEnding(text, ending string) string {
+	if ending == "\r\n" {
+		return strings.ReplaceAll(text, "\n", "\r\n")
+	}
+	return text
+}
+
+func fuzzyScore(candidate, query string) int {
+	candidate = strings.ToLower(candidate)
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return 1
+	}
+	score, pos := 0, 0
+	for _, q := range query {
+		found := false
+		for pos < len(candidate) {
+			if rune(candidate[pos]) == q {
+				score += 10
+				if pos == 0 || candidate[pos-1] == '/' || candidate[pos-1] == '\\' || candidate[pos-1] == '-' || candidate[pos-1] == '_' {
+					score += 5
+				}
+				pos++
+				found = true
+				break
+			}
+			pos++
+			score--
+		}
+		if !found {
+			return -999999
+		}
+	}
+	return score
+}
+
+func sortedFuzzy(candidates []string, query string, limit int) []string {
+	type scored struct {
+		value string
+		score int
+	}
+	var scoredItems []scored
+	for _, candidate := range candidates {
+		score := fuzzyScore(candidate, query)
+		if score > -999999 {
+			scoredItems = append(scoredItems, scored{value: candidate, score: score})
+		}
+	}
+	sort.Slice(scoredItems, func(i, j int) bool {
+		if scoredItems[i].score == scoredItems[j].score {
+			return scoredItems[i].value < scoredItems[j].value
+		}
+		return scoredItems[i].score > scoredItems[j].score
+	})
+	if len(scoredItems) > limit {
+		scoredItems = scoredItems[:limit]
+	}
+	out := make([]string, len(scoredItems))
+	for i, item := range scoredItems {
+		out[i] = item.value
+	}
+	return out
 }
 
 func (e *Editor) buildFileTree() {
@@ -733,6 +892,48 @@ func (e *Editor) fileDirty(path string) bool {
 	}
 	state, ok := e.fileStates[path]
 	return ok && state.dirty
+}
+
+func (e *Editor) allProjectFiles() []string {
+	var files []string
+	_ = filepath.WalkDir(e.rootDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := entry.Name()
+		if entry.IsDir() {
+			if path != e.rootDir && (strings.HasPrefix(name, ".") || e.ignoreNames[name]) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(name, ".") || e.ignoreNames[name] {
+			return nil
+		}
+		rel, relErr := filepath.Rel(e.rootDir, path)
+		if relErr == nil {
+			files = append(files, rel)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+func (e *Editor) addRecent(path string) {
+	if path == "" {
+		return
+	}
+	out := []string{path}
+	for _, recent := range e.recentFiles {
+		if recent != path {
+			out = append(out, recent)
+		}
+		if len(out) >= 20 {
+			break
+		}
+	}
+	e.recentFiles = out
 }
 
 // findNode recursively searches for a node with the given path
@@ -875,6 +1076,15 @@ func (e *Editor) positionOffset(pos Position) int {
 	return e.buffer.PositionOffset(pos)
 }
 
+func (e *Editor) offsetPosition(offset int) Position {
+	offset = clamp(offset, 0, e.buffer.Len())
+	line := sort.Search(len(e.buffer.lineStarts), func(i int) bool {
+		return e.buffer.lineStarts[i] > offset
+	}) - 1
+	line = clamp(line, 0, e.lineCount()-1)
+	return Position{x: offset - e.buffer.lineStarts[line], y: line}
+}
+
 func (e *Editor) line(y int) []rune {
 	return e.buffer.Line(y)
 }
@@ -950,7 +1160,8 @@ func (e *Editor) cachedText(text string, color sdl.Color) (*CachedText, error) {
 
 func (e *Editor) renderFileBrowser() {
 	// Render file browser panel background
-	e.renderer.SetDrawColor(20, 20, 20, 255)
+	panel := e.theme["panel"]
+	e.renderer.SetDrawColor(panel.R, panel.G, panel.B, panel.A)
 	e.renderer.FillRect(&sdl.Rect{X: 0, Y: 0, W: int32(e.fileBrowserWidth), H: e.windowHeight})
 
 	// Render file browser separator
@@ -1132,17 +1343,31 @@ func (e *Editor) deleteForward() {
 
 func (e *Editor) newline() {
 	insertOffset := e.positionOffset(Position{x: e.cursorX, y: e.cursorY})
+	line := e.line(e.cursorY)
+	indent := []rune{}
+	for _, r := range line {
+		if r == ' ' || r == '\t' {
+			indent = append(indent, r)
+		} else {
+			break
+		}
+	}
+	before := strings.TrimSpace(string(line[:clamp(e.cursorX, 0, len(line))]))
+	if strings.HasSuffix(before, "{") || strings.HasSuffix(before, ":") || strings.HasSuffix(before, "[") || strings.HasSuffix(before, "(") {
+		indent = append(indent, '\t')
+	}
+	inserted := append([]rune{'\n'}, indent...)
 
 	op := UndoOp{
 		deleteAt:     insertOffset,
 		insertAt:     insertOffset,
-		inserted:     []rune{'\n'},
+		inserted:     inserted,
 		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
 	}
 
-	e.buffer.Insert(insertOffset, []rune{'\n'})
+	e.buffer.Insert(insertOffset, inserted)
 	e.cursorY++
-	e.cursorX = 0
+	e.cursorX = len(indent)
 
 	e.idealCursorX = -1
 	e.invalidateMaxLineWidth()
@@ -1362,11 +1587,41 @@ func (e *Editor) moveToSelectionEnd() {
 func (e *Editor) copy() {
 	if e.hasSelection() {
 		sdl.SetClipboardText(e.getSelectedText())
+		return
 	}
+	sdl.SetClipboardText(string(e.line(e.cursorY)) + "\n")
+}
+
+func (e *Editor) cut() {
+	if e.hasSelection() {
+		e.copy()
+		e.deleteSelection()
+		return
+	}
+	e.copy()
+	e.deleteLine()
 }
 
 func isWordChar(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+}
+
+func bracketPair(r rune) (rune, int, bool) {
+	switch r {
+	case '(':
+		return ')', 1, true
+	case '[':
+		return ']', 1, true
+	case '{':
+		return '}', 1, true
+	case ')':
+		return '(', -1, true
+	case ']':
+		return '[', -1, true
+	case '}':
+		return '{', -1, true
+	}
+	return 0, 0, false
 }
 
 // isWordCharForSelection checks if a rune is part of a word for selection purposes
@@ -1558,6 +1813,10 @@ func (e *Editor) ensureCursorVisible() {
 	e.scrollOffsetY = clamp(e.scrollOffsetY, 0, maxScroll)
 
 	// Horizontal scrolling
+	if e.wordWrap {
+		e.scrollOffsetX = 0
+		return
+	}
 	cursorPixelX := e.getCursorPixelX()
 	codeAreaWidth := int(e.windowWidth) - e.fileBrowserWidth - gutterWidth - 20
 
@@ -1632,6 +1891,9 @@ func (e *Editor) rememberCurrentState() {
 		savedAtUndoDepth: e.savedAtUndoDepth,
 		dirty:            e.isDirty,
 		untitled:         e.untitled,
+		lineEnding:       e.lineEnding,
+		modTime:          e.diskModTime,
+		readOnly:         e.readOnly,
 	}
 }
 
@@ -1687,6 +1949,7 @@ func (e *Editor) saveSession() {
 		Root:        e.rootDir,
 		OpenFiles:   append([]string(nil), e.openFiles...),
 		CurrentFile: e.currentFile,
+		RecentFiles: append([]string(nil), e.recentFiles...),
 	}
 	data, err := json.MarshalIndent(session, "", "  ")
 	if err == nil {
@@ -1703,6 +1966,7 @@ func (e *Editor) restoreSession() {
 	if json.Unmarshal(data, &session) != nil || session.Root != e.rootDir {
 		return
 	}
+	e.recentFiles = append([]string(nil), session.RecentFiles...)
 	for _, path := range session.OpenFiles {
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			e.addOpenFile(path)
@@ -1721,11 +1985,17 @@ func (e *Editor) saveFile() error {
 	if e.currentFile == "" {
 		return fmt.Errorf("no file is currently open")
 	}
+	if e.readOnly {
+		return fmt.Errorf("file is read-only")
+	}
 
 	// Write to file
-	err := os.WriteFile(e.currentFile, []byte(e.buffer.String()), 0644)
+	err := os.WriteFile(e.currentFile, []byte(applyLineEnding(e.buffer.String(), e.lineEnding)), 0644)
 	if err != nil {
 		return err
+	}
+	if info, statErr := os.Stat(e.currentFile); statErr == nil {
+		e.diskModTime = info.ModTime().UnixNano()
 	}
 
 	// Record the undo stack depth at save time
@@ -1760,6 +2030,9 @@ func (e *Editor) loadFile(path string) error {
 		e.clearSelection()
 		e.undoStack = cloneUndoStack(savedState.undoStack)
 		e.redoStack = cloneUndoStack(savedState.redoStack)
+		e.lineEnding = savedState.lineEnding
+		e.diskModTime = savedState.modTime
+		e.readOnly = savedState.readOnly
 		e.invalidateMaxLineWidth()
 		e.invalidateFileBrowserWidth()
 		e.addOpenFile(path)
@@ -1771,6 +2044,18 @@ func (e *Editor) loadFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if isBinaryData(content) {
+		return fmt.Errorf("refusing to open likely binary file")
+	}
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		e.diskModTime = info.ModTime().UnixNano()
+		e.readOnly = info.Mode().Perm()&0200 == 0
+	} else {
+		e.diskModTime = 0
+		e.readOnly = false
+	}
+	e.lineEnding = detectLineEnding(content)
 	loadedDirty := false
 	if autoInfo, err := os.Stat(e.autosavePath(path)); err == nil {
 		if diskInfo, diskErr := os.Stat(path); diskErr != nil || autoInfo.ModTime().After(diskInfo.ModTime()) {
@@ -1786,7 +2071,7 @@ func (e *Editor) loadFile(path string) error {
 	e.redoStack = nil
 
 	// Convert content to string to properly handle UTF-8 multibyte characters
-	contentStr := string(content)
+	contentStr := normalizeNewlines(string(content))
 	e.buffer = NewPieceTable(contentStr)
 
 	e.currentFile = path
@@ -1802,6 +2087,7 @@ func (e *Editor) loadFile(path string) error {
 	e.invalidateMaxLineWidth()
 	e.invalidateFileBrowserWidth()
 	e.addOpenFile(path)
+	e.addRecent(path)
 	e.saveSession()
 
 	return nil
@@ -1878,6 +2164,9 @@ func (e *Editor) newUntitled() {
 	e.undoStack, e.redoStack = nil, nil
 	e.isDirty = true
 	e.savedAtUndoDepth = -1
+	e.lineEnding = "\n"
+	e.diskModTime = 0
+	e.readOnly = false
 	e.clearSelection()
 	e.invalidateMaxLineWidth()
 }
@@ -1890,8 +2179,15 @@ func (e *Editor) saveAs(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(e.buffer.String()), 0644); err != nil {
+	if e.lineEnding == "" {
+		e.lineEnding = "\n"
+	}
+	if err := os.WriteFile(path, []byte(applyLineEnding(e.buffer.String(), e.lineEnding)), 0644); err != nil {
 		return err
+	}
+	if info, err := os.Stat(path); err == nil {
+		e.diskModTime = info.ModTime().UnixNano()
+		e.readOnly = info.Mode().Perm()&0200 == 0
 	}
 	oldKey := e.currentKey()
 	delete(e.fileStates, oldKey)
@@ -1901,6 +2197,7 @@ func (e *Editor) saveAs(path string) error {
 	e.savedAtUndoDepth = len(e.undoStack)
 	e.isDirty = false
 	e.addOpenFile(path)
+	e.addRecent(path)
 	e.clearAutosave(path)
 	e.buildFileTree()
 	e.saveSession()
@@ -1985,6 +2282,12 @@ func (e *Editor) executeOverlay() {
 		err = e.executeCommand(text)
 	case overlayOpen:
 		err = e.loadFile(e.resolvePath(text))
+	case overlayFileFinder:
+		err = e.openFuzzyFile(text)
+	case overlayBuffer:
+		err = e.openFuzzyBuffer(text)
+	case overlayGrep:
+		err = e.openGrepResult(text)
 	case overlayCreate:
 		err = e.createFile(text)
 	case overlayRename:
@@ -2009,6 +2312,12 @@ func (e *Editor) executeOverlay() {
 	case overlayReplace:
 		e.searchReplace = text
 		e.replaceCurrentMatch()
+	case overlayDirtyPrompt:
+		err = e.finishDirtyPrompt(text)
+	case overlayReloadPrompt:
+		if strings.EqualFold(text, "yes") || strings.EqualFold(text, "y") {
+			err = e.reloadCurrentFile()
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
@@ -2022,6 +2331,15 @@ func (e *Editor) executeCommand(command string) error {
 		e.newUntitled()
 	case command == "open":
 		e.beginOverlay(overlayOpen, "Open file", "")
+	case command == "file" || command == "find file" || command == "fuzzy file":
+		e.beginOverlay(overlayFileFinder, "Find file", "")
+	case command == "buffer" || command == "switch buffer":
+		e.beginOverlay(overlayBuffer, "Switch buffer", "")
+	case command == "recent":
+		e.overlayItems = append([]string(nil), e.recentFiles...)
+		e.beginOverlay(overlayBuffer, "Recent file", "")
+	case command == "grep" || command == "project grep":
+		e.beginOverlay(overlayGrep, "Project grep", "")
 	case command == "create":
 		e.beginOverlay(overlayCreate, "Create file", "")
 	case command == "rename":
@@ -2054,10 +2372,145 @@ func (e *Editor) executeCommand(command string) error {
 		e.duplicateLine()
 	case command == "delete line":
 		e.deleteLine()
+	case command == "toggle whitespace":
+		e.showWhitespace = !e.showWhitespace
+	case command == "toggle wrap":
+		e.wordWrap = !e.wordWrap
+	case command == "reload":
+		return e.reloadCurrentFile()
+	case command == "temple" || command == "oracle":
+		e.theme["accent"] = sdl.Color{R: 85, G: 170, B: 255, A: 255}
+		e.theme["background"] = sdl.Color{R: 0, G: 0, B: 170, A: 255}
+		e.beginOverlay(overlayCommand, "Divine intellect", "640")
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
 	return nil
+}
+
+func (e *Editor) openFuzzyFile(query string) error {
+	matches := sortedFuzzy(e.allProjectFiles(), query, 1)
+	if len(matches) == 0 {
+		return fmt.Errorf("no file matched %q", query)
+	}
+	return e.loadFile(filepath.Join(e.rootDir, matches[0]))
+}
+
+func (e *Editor) openFuzzyBuffer(query string) error {
+	candidates := append([]string(nil), e.openFiles...)
+	candidates = append(candidates, e.recentFiles...)
+	matches := sortedFuzzy(candidates, query, 1)
+	if len(matches) == 0 {
+		return fmt.Errorf("no buffer matched %q", query)
+	}
+	return e.loadFile(matches[0])
+}
+
+func (e *Editor) projectGrep(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	var results []string
+	for _, rel := range e.allProjectFiles() {
+		path := filepath.Join(e.rootDir, rel)
+		data, err := os.ReadFile(path)
+		if err != nil || isBinaryData(data) {
+			continue
+		}
+		lines := strings.Split(normalizeNewlines(string(data)), "\n")
+		for i, line := range lines {
+			if strings.Contains(strings.ToLower(line), strings.ToLower(query)) {
+				results = append(results, fmt.Sprintf("%s:%d:%s", rel, i+1, strings.TrimSpace(line)))
+				break
+			}
+		}
+		if len(results) >= 80 {
+			break
+		}
+	}
+	return results
+}
+
+func (e *Editor) openGrepResult(query string) error {
+	results := e.projectGrep(query)
+	if len(results) == 0 {
+		return fmt.Errorf("no grep results for %q", query)
+	}
+	result := results[0]
+	parts := strings.SplitN(result, ":", 3)
+	if len(parts) < 2 {
+		return fmt.Errorf("bad grep result")
+	}
+	line, _ := strconv.Atoi(parts[1])
+	if err := e.loadFile(filepath.Join(e.rootDir, parts[0])); err != nil {
+		return err
+	}
+	e.cursorY = clamp(line-1, 0, e.lineCount()-1)
+	e.cursorX = 0
+	e.centerCursorOnScreen()
+	return nil
+}
+
+func (e *Editor) reloadCurrentFile() error {
+	if e.currentFile == "" {
+		return fmt.Errorf("no file is currently open")
+	}
+	delete(e.fileStates, e.currentFile)
+	path := e.currentFile
+	e.currentFile = ""
+	return e.loadFile(path)
+}
+
+func (e *Editor) checkExternalChange() {
+	if !e.reloadOnChanged || e.currentFile == "" || e.overlayActive {
+		return
+	}
+	info, err := os.Stat(e.currentFile)
+	if err != nil {
+		return
+	}
+	mod := info.ModTime().UnixNano()
+	if e.diskModTime != 0 && mod > e.diskModTime {
+		e.diskModTime = mod
+		e.beginOverlay(overlayReloadPrompt, "File changed on disk. Reload? yes/no", "")
+	}
+}
+
+func (e *Editor) updateMatchingBracket() {
+	e.matchingBracket = nil
+	if e.currentFile == "" && !e.untitled {
+		return
+	}
+	offset := e.positionOffset(Position{x: e.cursorX, y: e.cursorY})
+	text := []rune(e.buffer.String())
+	if offset >= len(text) && offset > 0 {
+		offset--
+	}
+	if offset < 0 || offset >= len(text) {
+		return
+	}
+	target, dir, ok := bracketPair(text[offset])
+	if !ok && offset > 0 {
+		offset--
+		target, dir, ok = bracketPair(text[offset])
+	}
+	if !ok {
+		return
+	}
+	depth := 0
+	for i := offset; i >= 0 && i < len(text); i += dir {
+		if text[i] == text[offset] {
+			depth++
+		} else if text[i] == target {
+			depth--
+			if depth == 0 {
+				pos := e.offsetPosition(i)
+				e.matchingBracket = &pos
+				return
+			}
+		}
+	}
 }
 
 func (e *Editor) paste() {
@@ -2121,6 +2574,12 @@ func (e *Editor) switchTab(delta int) {
 }
 
 func (e *Editor) closeCurrentTab() {
+	if e.isDirty {
+		e.pendingAction = "close"
+		e.pendingPath = e.currentFile
+		e.beginOverlay(overlayDirtyPrompt, "Unsaved changes: save, discard, cancel", "")
+		return
+	}
 	if e.currentFile == "" {
 		e.untitled = false
 		e.untitledName = ""
@@ -2138,6 +2597,59 @@ func (e *Editor) closeCurrentTab() {
 		_ = e.loadFile(e.openFiles[len(e.openFiles)-1])
 	}
 	e.saveSession()
+}
+
+func (e *Editor) hasDirtyBuffers() bool {
+	if e.isDirty {
+		return true
+	}
+	for _, state := range e.fileStates {
+		if state.dirty {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Editor) requestQuit() {
+	if e.hasDirtyBuffers() {
+		e.pendingAction = "quit"
+		e.beginOverlay(overlayDirtyPrompt, "Unsaved changes: save, discard, cancel", "")
+		return
+	}
+	e.running = false
+}
+
+func (e *Editor) finishDirtyPrompt(answer string) error {
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	switch answer {
+	case "save", "s":
+		if e.pendingAction == "close" {
+			if err := e.saveFile(); err != nil {
+				return err
+			}
+			e.isDirty = false
+			e.closeCurrentTab()
+		} else if e.pendingAction == "quit" {
+			if err := e.saveFile(); err != nil && e.currentFile != "" {
+				return err
+			}
+			e.running = false
+		}
+	case "discard", "d":
+		if e.pendingAction == "close" {
+			e.isDirty = false
+			e.closeCurrentTab()
+		} else if e.pendingAction == "quit" {
+			e.running = false
+		}
+	case "cancel", "c", "":
+	default:
+		return fmt.Errorf("expected save, discard, or cancel")
+	}
+	e.pendingAction = ""
+	e.pendingPath = ""
+	return nil
 }
 
 func (e *Editor) duplicateLine() {
@@ -2539,10 +3051,29 @@ func (e *Editor) handleOverlayKey(sym sdl.Keycode) bool {
 	return false
 }
 
+func keyChord(ctrl, shift, alt bool, sym sdl.Keycode) string {
+	parts := []string{}
+	if ctrl {
+		parts = append(parts, "Ctrl")
+	}
+	if shift {
+		parts = append(parts, "Shift")
+	}
+	if alt {
+		parts = append(parts, "Alt")
+	}
+	name := sdl.GetKeyName(sym)
+	if name == "" {
+		name = strconv.Itoa(int(sym))
+	}
+	parts = append(parts, name)
+	return strings.Join(parts, "+")
+}
+
 func (e *Editor) handleEvent(event sdl.Event) {
 	switch t := event.(type) {
 	case *sdl.QuitEvent:
-		e.running = false
+		e.requestQuit()
 	case *sdl.WindowEvent:
 		if t.Event == sdl.WINDOWEVENT_RESIZED {
 			e.windowWidth = int32(t.Data1)
@@ -2557,6 +3088,12 @@ func (e *Editor) handleEvent(event sdl.Event) {
 			ctrl := (t.Keysym.Mod & sdl.KMOD_CTRL) != 0
 			shift := (t.Keysym.Mod & sdl.KMOD_SHIFT) != 0
 			alt := (t.Keysym.Mod & sdl.KMOD_ALT) != 0
+			if command := e.keybindings[keyChord(ctrl, shift, alt, t.Keysym.Sym)]; command != "" {
+				if err := e.executeCommand(command); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+				}
+				return
+			}
 
 			// Handle Ctrl shortcuts
 			if ctrl && !shift {
@@ -2568,11 +3105,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 					e.copy()
 					return
 				case sdl.K_x:
-					// Cut: copy then delete selection
-					if e.hasSelection() {
-						e.copy()
-						e.deleteSelection()
-					}
+					e.cut()
 					return
 				case sdl.K_v:
 					e.paste()
@@ -2604,13 +3137,19 @@ func (e *Editor) handleEvent(event sdl.Event) {
 					e.beginOverlay(overlayGoto, "Go to line", "")
 					return
 				case sdl.K_p:
-					e.beginOverlay(overlayFilter, "Filter files", e.fileFilter)
+					e.beginOverlay(overlayFileFinder, "Find file", "")
 					return
 				case sdl.K_d:
 					e.duplicateLine()
 					return
 				case sdl.K_r:
 					e.buildFileTree()
+					return
+				case sdl.K_b:
+					e.beginOverlay(overlayBuffer, "Switch buffer", "")
+					return
+				case sdl.K_l:
+					_ = e.reloadCurrentFile()
 					return
 				case sdl.K_w:
 					e.closeCurrentTab()
@@ -2643,6 +3182,9 @@ func (e *Editor) handleEvent(event sdl.Event) {
 					return
 				case sdl.K_h:
 					e.beginOverlay(overlayReplace, "Replace current match with", e.searchReplace)
+					return
+				case sdl.K_f:
+					e.beginOverlay(overlayGrep, "Project grep", "")
 					return
 				}
 			}
@@ -2680,6 +3222,12 @@ func (e *Editor) handleEvent(event sdl.Event) {
 						e.updateSearchMatches()
 					}
 					return
+				case sdl.K_BACKQUOTE:
+					e.showWhitespace = !e.showWhitespace
+					return
+				case sdl.K_z:
+					e.wordWrap = !e.wordWrap
+					return
 				}
 			}
 
@@ -2703,6 +3251,10 @@ func (e *Editor) handleEvent(event sdl.Event) {
 			if t.Keysym.Sym == sdl.K_ESCAPE {
 				if e.searchActive {
 					e.deactivateSearch()
+					return
+				}
+				if !e.overlayActive {
+					e.requestQuit()
 					return
 				}
 			}
@@ -3192,14 +3744,14 @@ func (e *Editor) renderHighlightedLine(line []rune, x, y int32, scrollX int) {
 	col := int32(0)
 	for i := 0; i < len(line); {
 		start := i
-		color := sdl.Color{R: 200, G: 200, B: 200, A: 255}
+		color := e.theme["foreground"]
 		switch {
 		case i+1 < len(line) && line[i] == '/' && line[i+1] == '/':
 			i = len(line)
-			color = sdl.Color{R: 120, G: 150, B: 120, A: 255}
+			color = e.theme["comment"]
 		case line[i] == '#':
 			i = len(line)
-			color = sdl.Color{R: 120, G: 150, B: 120, A: 255}
+			color = e.theme["comment"]
 		case line[i] == '"' || line[i] == '\'':
 			quote := line[i]
 			i++
@@ -3214,21 +3766,28 @@ func (e *Editor) renderHighlightedLine(line []rune, x, y int32, scrollX int) {
 				}
 				i++
 			}
-			color = sdl.Color{R: 210, G: 170, B: 110, A: 255}
+			color = e.theme["string"]
 		case unicode.IsDigit(line[i]):
 			for i < len(line) && (unicode.IsDigit(line[i]) || line[i] == '.') {
 				i++
 			}
-			color = sdl.Color{R: 190, G: 150, B: 220, A: 255}
+			color = e.theme["number"]
 		case isWordChar(line[i]):
 			for i < len(line) && isWordChar(line[i]) {
 				i++
 			}
-			color = keywordColor(string(line[start:i]))
+			color = e.theme["foreground"]
+			if keywordColor(string(line[start:i])) != (sdl.Color{R: 200, G: 200, B: 200, A: 255}) {
+				color = e.theme["keyword"]
+			}
 		default:
 			i++
 		}
 		text := expandTabsForDisplay(line[start:i], tabWidth)
+		if e.showWhitespace {
+			text = strings.ReplaceAll(text, "\t", "→")
+			text = strings.ReplaceAll(text, " ", "·")
+		}
 		if text == "" {
 			continue
 		}
@@ -3283,8 +3842,8 @@ func (e *Editor) renderOverlay() {
 	if !e.overlayActive {
 		return
 	}
-	w := int32(520)
-	h := int32(96)
+	w := int32(620)
+	h := int32(180)
 	x := (e.windowWidth - w) / 2
 	y := int32(48)
 	e.renderer.SetDrawColor(28, 28, 28, 245)
@@ -3304,12 +3863,38 @@ func (e *Editor) renderOverlay() {
 		e.renderer.SetDrawColor(235, 235, 235, 255)
 		e.renderer.FillRect(&sdl.Rect{X: cursorX, Y: y + 40, W: 2, H: lineHeight})
 	}
-	if e.overlayMode == overlayCommand {
+	items := e.overlayPreviewItems()
+	for i, item := range items {
+		if i >= 6 {
+			break
+		}
+		if cached, err := e.cachedText(item, e.theme["muted"]); err == nil {
+			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: x + 12, Y: y + 70 + int32(i*lineHeight), W: cached.w, H: cached.h})
+		}
+	}
+	if e.overlayMode == overlayCommand && len(items) == 0 {
 		hint := "new open create rename delete goto find replace replace all filter refresh save save as next tab previous tab close tab"
 		if cached, err := e.cachedText(hint, sdl.Color{R: 120, G: 120, B: 120, A: 255}); err == nil {
 			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: x + 12, Y: y + 70, W: cached.w, H: cached.h})
 		}
 	}
+}
+
+func (e *Editor) overlayPreviewItems() []string {
+	switch e.overlayMode {
+	case overlayFileFinder:
+		return sortedFuzzy(e.allProjectFiles(), e.overlayText, 8)
+	case overlayBuffer:
+		candidates := append([]string(nil), e.openFiles...)
+		candidates = append(candidates, e.recentFiles...)
+		return sortedFuzzy(candidates, e.overlayText, 8)
+	case overlayGrep:
+		return e.projectGrep(e.overlayText)
+	case overlayCommand:
+		commands := []string{"new", "open", "find file", "switch buffer", "recent", "grep", "create", "rename", "delete", "goto", "find", "replace", "replace all", "filter", "refresh", "reload", "save", "save as", "next tab", "previous tab", "close tab", "duplicate line", "delete line", "toggle whitespace", "toggle wrap"}
+		return sortedFuzzy(commands, e.overlayText, 8)
+	}
+	return nil
 }
 
 // renderSearchBox renders the search box at the top of the code area
@@ -3453,6 +4038,7 @@ func (e *Editor) renderWelcomeScreen() {
 }
 
 func (e *Editor) render() {
+	e.updateMatchingBracket()
 	// Update window title
 	title := programName
 	if e.currentFile != "" {
@@ -3463,7 +4049,8 @@ func (e *Editor) render() {
 	}
 	e.window.SetTitle(title)
 
-	e.renderer.SetDrawColor(15, 15, 15, 255)
+	bg := e.theme["background"]
+	e.renderer.SetDrawColor(bg.R, bg.G, bg.B, bg.A)
 	e.renderer.Clear()
 
 	codeAreaX := int32(e.fileBrowserWidth)
@@ -3667,6 +4254,15 @@ func (e *Editor) render() {
 		}
 	}
 
+	if !e.searchActive && e.matchingBracket != nil && e.matchingBracket.y >= startLine && e.matchingBracket.y < endLine {
+		line := renderBuffer.Line(e.matchingBracket.y)
+		x := e.pixelWidthBefore(line, e.matchingBracket.x)
+		y := (e.matchingBracket.y - renderScrollY) * lineHeight
+		c := e.theme["bracket"]
+		e.renderer.SetDrawColor(c.R, c.G, c.B, 130)
+		e.renderer.FillRect(&sdl.Rect{X: codeAreaX + int32(gutterWidth+x-renderScrollX), Y: int32(y) + codeTop, W: int32(e.charWidth), H: lineHeight})
+	}
+
 	// Render text (only visible lines)
 	for y := startLine; y < endLine; y++ {
 		line := renderBuffer.Line(y)
@@ -3739,6 +4335,7 @@ func (e *Editor) run() {
 			for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 				e.handleEvent(event)
 			}
+			e.checkExternalChange()
 
 			// Render once after handling all events
 			e.render()
