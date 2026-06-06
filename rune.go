@@ -2774,8 +2774,8 @@ func main() {
 		}
 	}
 
-	// If not detached, re-execute ourselves in detached mode
-	if !isDetached {
+	// If configured for this platform, re-execute ourselves in detached mode.
+	if !isDetached && shouldAutoDetach() {
 		exe, err := os.Executable()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
@@ -2802,7 +2802,6 @@ func main() {
 		return
 	}
 
-	// We're the detached child process, run the editor
 	editor, err := NewEditor(targetPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create editor: %v\n", err)

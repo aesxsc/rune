@@ -15,6 +15,9 @@ const (
 func configureDetachedCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: windowsDetachedProcess | windowsCreateNewProcessGroup,
-		HideWindow:    true,
 	}
+}
+
+func shouldAutoDetach() bool {
+	return false
 }

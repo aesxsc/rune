@@ -12,3 +12,7 @@ func configureDetachedCommand(cmd *exec.Cmd) {
 		Setsid: true,
 	}
 }
+
+func shouldAutoDetach() bool {
+	return true
+}
