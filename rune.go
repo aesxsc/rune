@@ -2,13 +2,16 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/veandco/go-sdl2/sdl"
@@ -26,8 +29,9 @@ const (
 	lineHeight          = 20
 	tabWidth            = 4
 	gutterWidth         = 60
-	fileBrowserWidth    = 250
+	defaultBrowserWidth = 250
 	textCacheLimit      = 2048
+	tabBarHeight        = 24
 )
 
 func clamp(value, min, max int) int {
@@ -67,7 +71,36 @@ type FileState struct {
 	undoStack        []UndoOp
 	redoStack        []UndoOp
 	savedAtUndoDepth int
+	dirty            bool
+	untitled         bool
 }
+
+type EditorConfig struct {
+	Ignore         []string `json:"ignore"`
+	AutosaveMillis int      `json:"autosave_ms"`
+	BrowserWidth   int      `json:"browser_width"`
+}
+
+type SessionState struct {
+	Root        string   `json:"root"`
+	OpenFiles   []string `json:"open_files"`
+	CurrentFile string   `json:"current_file"`
+}
+
+type OverlayMode int
+
+const (
+	overlayNone OverlayMode = iota
+	overlayCommand
+	overlayOpen
+	overlayCreate
+	overlayRename
+	overlayDelete
+	overlayGoto
+	overlayFilter
+	overlaySaveAs
+	overlayReplace
+)
 
 type FileNode struct {
 	name     string
@@ -405,8 +438,13 @@ type Editor struct {
 	redoStack                []UndoOp
 	mouseDown                bool
 	scrollbarDragging        bool
+	fileBrowserResizing      bool
 	rootDir                  string
 	currentFile              string
+	untitled                 bool
+	untitledName             string
+	untitledCounter          int
+	openFiles                []string
 	fileStates               map[string]*FileState
 	isDirty                  bool
 	savedAtUndoDepth         int // Undo stack depth when file was saved (-1 = unreachable)
@@ -415,6 +453,7 @@ type Editor struct {
 	flatFileList             []*FileNode
 	fileBrowserScroll        int
 	fileBrowserScrollX       int
+	fileBrowserWidth         int
 	fileBrowserMaxWidth      int
 	fileBrowserMaxWidthDirty bool
 	window                   *sdl.Window
@@ -434,8 +473,22 @@ type Editor struct {
 	ibeamCursor              *sdl.Cursor // Text/I-beam cursor
 	searchActive             bool        // Whether search box is currently active
 	searchMatches            []Position  // All match positions
-	currentMatchIndex        int         // Index of currently highlighted match
-	savedEditorState         *FileState  // Saved editor state when search is active
+	searchMatchLens          []int
+	currentMatchIndex        int        // Index of currently highlighted match
+	savedEditorState         *FileState // Saved editor state when search is active
+	searchCaseSensitive      bool
+	searchWholeWord          bool
+	searchRegex              bool
+	searchReplace            string
+	overlayActive            bool
+	overlayMode              OverlayMode
+	overlayTitle             string
+	overlayText              string
+	fileFilter               string
+	ignoreNames              map[string]bool
+	stateDir                 string
+	autosaveInterval         time.Duration
+	lastAutosave             time.Time
 }
 
 func NewEditor(rootPath string) (*Editor, error) {
@@ -499,6 +552,27 @@ func NewEditor(rootPath string) (*Editor, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("path is not a directory: %s", absPath)
 	}
+	stateDir := filepath.Join(absPath, ".rune")
+	_ = os.MkdirAll(filepath.Join(stateDir, "autosave"), 0755)
+	config := loadEditorConfig(absPath)
+	ignoreNames := make(map[string]bool)
+	for _, name := range []string{".git", ".rune", "node_modules", "dist", "vendor"} {
+		ignoreNames[name] = true
+	}
+	for _, name := range config.Ignore {
+		if name != "" {
+			ignoreNames[name] = true
+		}
+	}
+	browserWidth := config.BrowserWidth
+	if browserWidth <= 0 {
+		browserWidth = defaultBrowserWidth
+	}
+	browserWidth = clamp(browserWidth, 120, 600)
+	autosaveMillis := config.AutosaveMillis
+	if autosaveMillis <= 0 {
+		autosaveMillis = 3000
+	}
 
 	// Create system cursors
 	arrowCursor := sdl.CreateSystemCursor(sdl.SYSTEM_CURSOR_ARROW)
@@ -512,10 +586,12 @@ func NewEditor(rootPath string) (*Editor, error) {
 		windowWidth:              initialWindowWidth,
 		windowHeight:             initialWindowHeight,
 		rootDir:                  absPath,
+		untitledCounter:          1,
 		fileStates:               make(map[string]*FileState),
 		nodeByPath:               make(map[string]*FileNode),
 		isDirty:                  false,
 		savedAtUndoDepth:         0,
+		fileBrowserWidth:         browserWidth,
 		window:                   window,
 		renderer:                 renderer,
 		font:                     font,
@@ -527,6 +603,9 @@ func NewEditor(rootPath string) (*Editor, error) {
 		fileBrowserMaxWidthDirty: true,
 		arrowCursor:              arrowCursor,
 		ibeamCursor:              ibeamCursor,
+		ignoreNames:              ignoreNames,
+		stateDir:                 stateDir,
+		autosaveInterval:         time.Duration(autosaveMillis) * time.Millisecond,
 	}
 	if w, _, err := font.SizeUTF8("M"); err == nil && w > 0 {
 		editor.charWidth = w
@@ -534,8 +613,24 @@ func NewEditor(rootPath string) (*Editor, error) {
 
 	// Build file tree
 	editor.buildFileTree()
+	editor.restoreSession()
 
 	return editor, nil
+}
+
+func loadEditorConfig(root string) EditorConfig {
+	config := EditorConfig{}
+	for _, path := range []string{
+		filepath.Join(root, ".rune", "config.json"),
+		filepath.Join(root, ".rune.json"),
+	} {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			_ = json.Unmarshal(data, &config)
+			return config
+		}
+	}
+	return config
 }
 
 func (e *Editor) buildFileTree() {
@@ -572,7 +667,7 @@ func (e *Editor) readDirectory(node *FileNode) {
 
 	for _, entry := range entries {
 		// Skip hidden files
-		if strings.HasPrefix(entry.Name(), ".") {
+		if strings.HasPrefix(entry.Name(), ".") || e.ignoreNames[entry.Name()] {
 			continue
 		}
 
@@ -605,6 +700,9 @@ func (e *Editor) flattenNode(node *FileNode) {
 		return
 	}
 
+	if e.fileFilter != "" && !e.nodeMatchesFilter(node) {
+		return
+	}
 	e.flatFileList = append(e.flatFileList, node)
 
 	if node.isDir && node.expanded {
@@ -612,6 +710,29 @@ func (e *Editor) flattenNode(node *FileNode) {
 			e.flattenNode(child)
 		}
 	}
+}
+
+func (e *Editor) nodeMatchesFilter(node *FileNode) bool {
+	filter := strings.ToLower(e.fileFilter)
+	if strings.Contains(strings.ToLower(node.name), filter) {
+		return true
+	}
+	if node.isDir {
+		for _, child := range node.children {
+			if e.nodeMatchesFilter(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *Editor) fileDirty(path string) bool {
+	if path == e.currentFile {
+		return e.isDirty
+	}
+	state, ok := e.fileStates[path]
+	return ok && state.dirty
 }
 
 // findNode recursively searches for a node with the given path
@@ -775,12 +896,8 @@ func (e *Editor) getFileBrowserMaxWidth() int {
 		indent := node.depth * 12
 		iconWidth := 2 * e.charWidth
 		nameLen := len([]rune(node.name))
-		if !node.isDir {
-			if node.path == e.currentFile && e.isDirty {
-				nameLen += 2
-			} else if _, exists := e.fileStates[node.path]; exists {
-				nameLen += 2
-			}
+		if !node.isDir && e.fileDirty(node.path) {
+			nameLen += 2
 		}
 		totalWidth := 5 + indent + iconWidth + nameLen*e.charWidth
 		if totalWidth > maxWidth {
@@ -834,17 +951,17 @@ func (e *Editor) cachedText(text string, color sdl.Color) (*CachedText, error) {
 func (e *Editor) renderFileBrowser() {
 	// Render file browser panel background
 	e.renderer.SetDrawColor(20, 20, 20, 255)
-	e.renderer.FillRect(&sdl.Rect{X: 0, Y: 0, W: fileBrowserWidth, H: e.windowHeight})
+	e.renderer.FillRect(&sdl.Rect{X: 0, Y: 0, W: int32(e.fileBrowserWidth), H: e.windowHeight})
 
 	// Render file browser separator
 	e.renderer.SetDrawColor(50, 50, 50, 255)
-	e.renderer.DrawLine(fileBrowserWidth, 0, fileBrowserWidth, e.windowHeight)
+	e.renderer.DrawLine(int32(e.fileBrowserWidth), 0, int32(e.fileBrowserWidth), e.windowHeight)
 
 	// Set clip rect for file browser to prevent overflow
 	fileBrowserClipRect := &sdl.Rect{
 		X: 0,
 		Y: 0,
-		W: fileBrowserWidth,
+		W: int32(e.fileBrowserWidth),
 		H: e.windowHeight,
 	}
 	e.renderer.SetClipRect(fileBrowserClipRect)
@@ -853,10 +970,19 @@ func (e *Editor) renderFileBrowser() {
 	highlightedNode := e.getHighlightedNode()
 
 	// Render file browser items
-	fileBrowserVisibleLines := int(e.windowHeight) / lineHeight
+	filterOffset := 0
+	if e.fileFilter != "" {
+		filterText := "/" + e.fileFilter
+		cached, err := e.cachedText(filterText, sdl.Color{R: 120, G: 180, B: 220, A: 255})
+		if err == nil {
+			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: 6, Y: 2, W: cached.w, H: cached.h})
+		}
+		filterOffset = lineHeight
+	}
+	fileBrowserVisibleLines := (int(e.windowHeight) - filterOffset) / lineHeight
 	for i := e.fileBrowserScroll; i < len(e.flatFileList) && i < e.fileBrowserScroll+fileBrowserVisibleLines; i++ {
 		node := e.flatFileList[i]
-		y := (i - e.fileBrowserScroll) * lineHeight
+		y := filterOffset + (i-e.fileBrowserScroll)*lineHeight
 
 		// Highlight if this is the active node
 		if highlightedNode != nil && node.path == highlightedNode.path {
@@ -864,7 +990,7 @@ func (e *Editor) renderFileBrowser() {
 			e.renderer.FillRect(&sdl.Rect{
 				X: 0,
 				Y: int32(y),
-				W: fileBrowserWidth,
+				W: int32(e.fileBrowserWidth),
 				H: lineHeight,
 			})
 		}
@@ -885,14 +1011,7 @@ func (e *Editor) renderFileBrowser() {
 		// Check if this file has unsaved changes
 		hasUnsavedChanges := false
 		if !node.isDir {
-			// Check if it's the current file with unsaved changes
-			if node.path == e.currentFile && e.isDirty {
-				hasUnsavedChanges = true
-			}
-			// Check if it's in fileStates (other files with unsaved changes)
-			if _, exists := e.fileStates[node.path]; exists {
-				hasUnsavedChanges = true
-			}
+			hasUnsavedChanges = e.fileDirty(node.path)
 		}
 
 		displayText := icon + node.name
@@ -1066,6 +1185,7 @@ func (e *Editor) recordUndo(op UndoOp) {
 	if e.searchActive {
 		e.updateSearchMatches()
 	}
+	e.maybeAutosave()
 }
 
 func (e *Editor) undo() {
@@ -1355,7 +1475,11 @@ func (e *Editor) moveWordRight() {
 
 func (e *Editor) getCursorFromMouse(x, y int32) (int, int) {
 	// Calculate line from y position (accounting for scroll)
-	lineY := int(y)/lineHeight + e.scrollOffsetY
+	top := tabBarHeight
+	if e.searchActive {
+		top += 30
+	}
+	lineY := (int(y)-top)/lineHeight + e.scrollOffsetY
 	if lineY < 0 {
 		lineY = 0
 	}
@@ -1364,7 +1488,7 @@ func (e *Editor) getCursorFromMouse(x, y int32) (int, int) {
 	}
 
 	// Adjust x for file browser and gutter, and add horizontal scroll
-	adjustedX := int(x) - fileBrowserWidth - gutterWidth + e.scrollOffsetX
+	adjustedX := int(x) - e.fileBrowserWidth - gutterWidth + e.scrollOffsetX
 
 	if adjustedX < 0 {
 		return 0, lineY
@@ -1375,7 +1499,11 @@ func (e *Editor) getCursorFromMouse(x, y int32) (int, int) {
 }
 
 func (e *Editor) getVisibleLines() int {
-	return int(e.windowHeight) / lineHeight
+	used := tabBarHeight
+	if e.searchActive {
+		used += 30
+	}
+	return max(1, (int(e.windowHeight)-used)/lineHeight)
 }
 
 func (e *Editor) getCursorPixelX() int {
@@ -1431,7 +1559,7 @@ func (e *Editor) ensureCursorVisible() {
 
 	// Horizontal scrolling
 	cursorPixelX := e.getCursorPixelX()
-	codeAreaWidth := int(e.windowWidth) - fileBrowserWidth - gutterWidth - 20
+	codeAreaWidth := int(e.windowWidth) - e.fileBrowserWidth - gutterWidth - 20
 
 	// Scroll right if cursor is beyond visible area
 	if cursorPixelX >= e.scrollOffsetX+codeAreaWidth {
@@ -1459,7 +1587,7 @@ func (e *Editor) centerCursorOnScreen() {
 
 	// Center horizontally
 	cursorPixelX := e.getCursorPixelX()
-	codeAreaWidth := int(e.windowWidth) - fileBrowserWidth - gutterWidth - 20
+	codeAreaWidth := int(e.windowWidth) - e.fileBrowserWidth - gutterWidth - 20
 
 	e.scrollOffsetX = cursorPixelX - codeAreaWidth/2
 
@@ -1473,7 +1601,123 @@ func (e *Editor) scroll(delta int) {
 	e.scrollOffsetY = clamp(e.scrollOffsetY, 0, maxScroll)
 }
 
+func (e *Editor) currentKey() string {
+	if e.untitled {
+		return e.untitledName
+	}
+	return e.currentFile
+}
+
+func (e *Editor) displayName(path string) string {
+	if path == "" {
+		if e.untitled {
+			return e.untitledName
+		}
+		return ""
+	}
+	return filepath.Base(path)
+}
+
+func (e *Editor) rememberCurrentState() {
+	key := e.currentKey()
+	if key == "" {
+		return
+	}
+	e.fileStates[key] = &FileState{
+		buffer:           e.buffer.Clone(),
+		cursor:           Position{x: e.cursorX, y: e.cursorY},
+		scroll:           Position{x: e.scrollOffsetX, y: e.scrollOffsetY},
+		undoStack:        cloneUndoStack(e.undoStack),
+		redoStack:        cloneUndoStack(e.redoStack),
+		savedAtUndoDepth: e.savedAtUndoDepth,
+		dirty:            e.isDirty,
+		untitled:         e.untitled,
+	}
+}
+
+func (e *Editor) addOpenFile(path string) {
+	if path == "" {
+		return
+	}
+	for _, open := range e.openFiles {
+		if open == path {
+			return
+		}
+	}
+	e.openFiles = append(e.openFiles, path)
+}
+
+func (e *Editor) removeOpenFile(path string) {
+	for i, open := range e.openFiles {
+		if open == path {
+			e.openFiles = append(e.openFiles[:i], e.openFiles[i+1:]...)
+			return
+		}
+	}
+}
+
+func (e *Editor) autosavePath(path string) string {
+	clean := filepath.Clean(path)
+	name := strings.Map(func(r rune) rune {
+		if r == ':' || r == '\\' || r == '/' || r == '?' || r == '*' || r == '"' || r == '<' || r == '>' || r == '|' {
+			return '_'
+		}
+		return r
+	}, clean)
+	return filepath.Join(e.stateDir, "autosave", name+".autosave")
+}
+
+func (e *Editor) maybeAutosave() {
+	if e.currentFile == "" || !e.isDirty || time.Since(e.lastAutosave) < e.autosaveInterval {
+		return
+	}
+	_ = os.WriteFile(e.autosavePath(e.currentFile), []byte(e.buffer.String()), 0644)
+	e.lastAutosave = time.Now()
+}
+
+func (e *Editor) clearAutosave(path string) {
+	if path != "" {
+		_ = os.Remove(e.autosavePath(path))
+	}
+}
+
+func (e *Editor) saveSession() {
+	e.rememberCurrentState()
+	session := SessionState{
+		Root:        e.rootDir,
+		OpenFiles:   append([]string(nil), e.openFiles...),
+		CurrentFile: e.currentFile,
+	}
+	data, err := json.MarshalIndent(session, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(filepath.Join(e.stateDir, "session.json"), data, 0644)
+	}
+}
+
+func (e *Editor) restoreSession() {
+	data, err := os.ReadFile(filepath.Join(e.stateDir, "session.json"))
+	if err != nil {
+		return
+	}
+	var session SessionState
+	if json.Unmarshal(data, &session) != nil || session.Root != e.rootDir {
+		return
+	}
+	for _, path := range session.OpenFiles {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			e.addOpenFile(path)
+		}
+	}
+	if session.CurrentFile != "" {
+		_ = e.loadFile(session.CurrentFile)
+	}
+}
+
 func (e *Editor) saveFile() error {
+	if e.untitled {
+		e.beginOverlay(overlaySaveAs, "Save as", "")
+		return nil
+	}
 	if e.currentFile == "" {
 		return fmt.Errorf("no file is currently open")
 	}
@@ -1487,50 +1731,54 @@ func (e *Editor) saveFile() error {
 	// Record the undo stack depth at save time
 	e.savedAtUndoDepth = len(e.undoStack)
 	e.isDirty = false
-	delete(e.fileStates, e.currentFile)
+	if state, ok := e.fileStates[e.currentFile]; ok {
+		state.dirty = false
+		state.savedAtUndoDepth = e.savedAtUndoDepth
+	}
+	e.clearAutosave(e.currentFile)
 	e.invalidateFileBrowserWidth()
+	e.saveSession()
 
 	return nil
 }
 
 func (e *Editor) loadFile(path string) error {
-	// Save current file state if we have unsaved changes
-	if e.currentFile != "" && e.isDirty {
-		state := &FileState{
-			buffer:           e.buffer.Clone(),
-			cursor:           Position{x: e.cursorX, y: e.cursorY},
-			scroll:           Position{x: e.scrollOffsetX, y: e.scrollOffsetY},
-			undoStack:        cloneUndoStack(e.undoStack),
-			redoStack:        cloneUndoStack(e.redoStack),
-			savedAtUndoDepth: e.savedAtUndoDepth,
-		}
-		e.fileStates[e.currentFile] = state
-		e.invalidateFileBrowserWidth()
-	}
+	path, _ = filepath.Abs(path)
+	e.rememberCurrentState()
 
-	// Check if we have unsaved changes for this file
 	if savedState, exists := e.fileStates[path]; exists {
-		// Restore from saved state
 		e.buffer = savedState.buffer.Clone()
 		e.cursorX = savedState.cursor.x
 		e.cursorY = savedState.cursor.y
 		e.scrollOffsetX = savedState.scroll.x
 		e.scrollOffsetY = savedState.scroll.y
 		e.currentFile = path
-		e.isDirty = true
+		e.untitled = false
+		e.untitledName = ""
+		e.isDirty = savedState.dirty
 		e.savedAtUndoDepth = savedState.savedAtUndoDepth
 		e.clearSelection()
 		e.undoStack = cloneUndoStack(savedState.undoStack)
 		e.redoStack = cloneUndoStack(savedState.redoStack)
 		e.invalidateMaxLineWidth()
 		e.invalidateFileBrowserWidth()
+		e.addOpenFile(path)
+		e.saveSession()
 		return nil
 	}
 
-	// Load from disk
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return err
+	}
+	loadedDirty := false
+	if autoInfo, err := os.Stat(e.autosavePath(path)); err == nil {
+		if diskInfo, diskErr := os.Stat(path); diskErr != nil || autoInfo.ModTime().After(diskInfo.ModTime()) {
+			if autosaved, readErr := os.ReadFile(e.autosavePath(path)); readErr == nil {
+				content = autosaved
+				loadedDirty = true
+			}
+		}
 	}
 
 	// Clear undo/redo stacks
@@ -1542,26 +1790,37 @@ func (e *Editor) loadFile(path string) error {
 	e.buffer = NewPieceTable(contentStr)
 
 	e.currentFile = path
+	e.untitled = false
+	e.untitledName = ""
 	e.cursorX = 0
 	e.cursorY = 0
 	e.scrollOffsetX = 0
 	e.scrollOffsetY = 0
-	e.isDirty = false
+	e.isDirty = loadedDirty
 	e.savedAtUndoDepth = 0 // Empty undo stack = just loaded state
 	e.clearSelection()
 	e.invalidateMaxLineWidth()
 	e.invalidateFileBrowserWidth()
+	e.addOpenFile(path)
+	e.saveSession()
 
 	return nil
 }
 
 func (e *Editor) handleFileBrowserClick(x, y int32) {
-	if x >= fileBrowserWidth {
+	if x >= int32(e.fileBrowserWidth) {
 		return
 	}
 
 	// Calculate which file was clicked
-	clickedLine := int(y) / lineHeight
+	offset := 0
+	if e.fileFilter != "" {
+		offset = lineHeight
+	}
+	if int(y) < offset {
+		return
+	}
+	clickedLine := (int(y) - offset) / lineHeight
 	clickedIndex := e.fileBrowserScroll + clickedLine
 
 	if clickedIndex >= 0 && clickedIndex < len(e.flatFileList) {
@@ -1579,6 +1838,226 @@ func (e *Editor) handleFileBrowserClick(x, y int32) {
 			e.loadFile(node.path)
 		}
 	}
+}
+
+func (e *Editor) resolvePath(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	if filepath.IsAbs(input) {
+		return filepath.Clean(input)
+	}
+	return filepath.Join(e.rootDir, input)
+}
+
+func (e *Editor) beginOverlay(mode OverlayMode, title, text string) {
+	e.overlayActive = true
+	e.overlayMode = mode
+	e.overlayTitle = title
+	e.overlayText = text
+	e.clearSelection()
+}
+
+func (e *Editor) closeOverlay() {
+	e.overlayActive = false
+	e.overlayMode = overlayNone
+	e.overlayTitle = ""
+	e.overlayText = ""
+}
+
+func (e *Editor) newUntitled() {
+	e.rememberCurrentState()
+	e.untitledName = fmt.Sprintf("untitled-%d", e.untitledCounter)
+	e.untitledCounter++
+	e.untitled = true
+	e.currentFile = ""
+	e.buffer = NewPieceTable("")
+	e.cursorX, e.cursorY = 0, 0
+	e.scrollOffsetX, e.scrollOffsetY = 0, 0
+	e.undoStack, e.redoStack = nil, nil
+	e.isDirty = true
+	e.savedAtUndoDepth = -1
+	e.clearSelection()
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) saveAs(path string) error {
+	path = e.resolvePath(path)
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(e.buffer.String()), 0644); err != nil {
+		return err
+	}
+	oldKey := e.currentKey()
+	delete(e.fileStates, oldKey)
+	e.currentFile = path
+	e.untitled = false
+	e.untitledName = ""
+	e.savedAtUndoDepth = len(e.undoStack)
+	e.isDirty = false
+	e.addOpenFile(path)
+	e.clearAutosave(path)
+	e.buildFileTree()
+	e.saveSession()
+	return nil
+}
+
+func (e *Editor) createFile(path string) error {
+	path = e.resolvePath(path)
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return err
+	}
+	_ = file.Close()
+	e.buildFileTree()
+	return e.loadFile(path)
+}
+
+func (e *Editor) renameCurrent(path string) error {
+	if e.currentFile == "" {
+		return fmt.Errorf("no file is currently open")
+	}
+	path = e.resolvePath(path)
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	e.rememberCurrentState()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := os.Rename(e.currentFile, path); err != nil {
+		return err
+	}
+	state := e.fileStates[e.currentFile]
+	delete(e.fileStates, e.currentFile)
+	if state != nil {
+		e.fileStates[path] = state
+	}
+	e.removeOpenFile(e.currentFile)
+	e.currentFile = path
+	e.addOpenFile(path)
+	e.buildFileTree()
+	e.saveSession()
+	return nil
+}
+
+func (e *Editor) deleteCurrentFile() error {
+	if e.currentFile == "" {
+		return fmt.Errorf("no file is currently open")
+	}
+	path := e.currentFile
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	delete(e.fileStates, path)
+	e.removeOpenFile(path)
+	e.clearAutosave(path)
+	e.currentFile = ""
+	e.untitled = false
+	e.buffer = NewPieceTable("")
+	e.isDirty = false
+	e.buildFileTree()
+	if len(e.openFiles) > 0 {
+		return e.loadFile(e.openFiles[len(e.openFiles)-1])
+	}
+	e.saveSession()
+	return nil
+}
+
+func (e *Editor) executeOverlay() {
+	text := strings.TrimSpace(e.overlayText)
+	mode := e.overlayMode
+	e.closeOverlay()
+	var err error
+	switch mode {
+	case overlayCommand:
+		err = e.executeCommand(text)
+	case overlayOpen:
+		err = e.loadFile(e.resolvePath(text))
+	case overlayCreate:
+		err = e.createFile(text)
+	case overlayRename:
+		err = e.renameCurrent(text)
+	case overlayDelete:
+		if strings.EqualFold(text, "yes") || strings.EqualFold(text, "y") {
+			err = e.deleteCurrentFile()
+		}
+	case overlayGoto:
+		var line int
+		line, err = strconv.Atoi(text)
+		if err == nil {
+			e.cursorY = clamp(line-1, 0, e.lineCount()-1)
+			e.cursorX = clamp(e.cursorX, 0, len(e.line(e.cursorY)))
+			e.centerCursorOnScreen()
+		}
+	case overlayFilter:
+		e.fileFilter = text
+		e.flattenTree()
+	case overlaySaveAs:
+		err = e.saveAs(text)
+	case overlayReplace:
+		e.searchReplace = text
+		e.replaceCurrentMatch()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+	}
+}
+
+func (e *Editor) executeCommand(command string) error {
+	command = strings.ToLower(strings.TrimSpace(command))
+	switch {
+	case command == "new" || command == "new file":
+		e.newUntitled()
+	case command == "open":
+		e.beginOverlay(overlayOpen, "Open file", "")
+	case command == "create":
+		e.beginOverlay(overlayCreate, "Create file", "")
+	case command == "rename":
+		e.beginOverlay(overlayRename, "Rename current file", e.currentFile)
+	case command == "delete":
+		e.beginOverlay(overlayDelete, "Delete current file? type yes", "")
+	case command == "goto" || command == "go to line":
+		e.beginOverlay(overlayGoto, "Go to line", "")
+	case command == "find":
+		e.activateSearch()
+	case command == "replace":
+		e.beginOverlay(overlayReplace, "Replace current match with", e.searchReplace)
+	case command == "replace all":
+		e.replaceAllMatches()
+	case command == "filter":
+		e.beginOverlay(overlayFilter, "Filter files", e.fileFilter)
+	case command == "refresh":
+		e.buildFileTree()
+	case command == "save":
+		return e.saveFile()
+	case command == "save as":
+		e.beginOverlay(overlaySaveAs, "Save as", e.currentFile)
+	case command == "next tab":
+		e.switchTab(1)
+	case command == "previous tab":
+		e.switchTab(-1)
+	case command == "close tab":
+		e.closeCurrentTab()
+	case command == "duplicate line":
+		e.duplicateLine()
+	case command == "delete line":
+		e.deleteLine()
+	default:
+		return fmt.Errorf("unknown command %q", command)
+	}
+	return nil
 }
 
 func (e *Editor) paste() {
@@ -1625,8 +2104,213 @@ func (e *Editor) paste() {
 	e.recordUndo(op)
 }
 
+func (e *Editor) switchTab(delta int) {
+	if len(e.openFiles) == 0 {
+		return
+	}
+	current := e.currentFile
+	idx := 0
+	for i, path := range e.openFiles {
+		if path == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta + len(e.openFiles)) % len(e.openFiles)
+	_ = e.loadFile(e.openFiles[idx])
+}
+
+func (e *Editor) closeCurrentTab() {
+	if e.currentFile == "" {
+		e.untitled = false
+		e.untitledName = ""
+		e.buffer = NewPieceTable("")
+		e.isDirty = false
+		return
+	}
+	closing := e.currentFile
+	delete(e.fileStates, closing)
+	e.removeOpenFile(closing)
+	e.currentFile = ""
+	e.buffer = NewPieceTable("")
+	e.isDirty = false
+	if len(e.openFiles) > 0 {
+		_ = e.loadFile(e.openFiles[len(e.openFiles)-1])
+	}
+	e.saveSession()
+}
+
+func (e *Editor) duplicateLine() {
+	line := append([]rune(nil), e.line(e.cursorY)...)
+	insert := append([]rune{'\n'}, line...)
+	offset := e.positionOffset(Position{x: len(e.line(e.cursorY)), y: e.cursorY})
+	op := UndoOp{
+		deleteAt:     offset,
+		insertAt:     offset,
+		inserted:     insert,
+		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
+	}
+	e.buffer.Insert(offset, insert)
+	e.cursorY++
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) deleteLine() {
+	start := e.positionOffset(Position{x: 0, y: e.cursorY})
+	end := e.positionOffset(Position{x: len(e.line(e.cursorY)), y: e.cursorY})
+	if e.cursorY < e.lineCount()-1 {
+		end++
+	} else if e.cursorY > 0 {
+		start--
+	}
+	deleted := e.buffer.Slice(start, end-start)
+	if len(deleted) == 0 {
+		return
+	}
+	op := UndoOp{
+		deleteAt:     start,
+		deleted:      deleted,
+		insertAt:     start,
+		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
+	}
+	e.buffer.Delete(start, len(deleted))
+	e.cursorY = clamp(e.cursorY, 0, e.lineCount()-1)
+	e.cursorX = clamp(e.cursorX, 0, len(e.line(e.cursorY)))
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) moveLine(delta int) {
+	if e.lineCount() < 2 {
+		return
+	}
+	target := e.cursorY + delta
+	if target < 0 || target >= e.lineCount() {
+		return
+	}
+	lines := strings.Split(e.buffer.String(), "\n")
+	lines[e.cursorY], lines[target] = lines[target], lines[e.cursorY]
+	old := []rune(e.buffer.String())
+	newText := []rune(strings.Join(lines, "\n"))
+	op := UndoOp{
+		deleteAt:     0,
+		deleted:      old,
+		insertAt:     0,
+		inserted:     newText,
+		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
+	}
+	e.buffer.Delete(0, e.buffer.Len())
+	e.buffer.Insert(0, newText)
+	e.cursorY = target
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) indentSelection(prefix string) {
+	startLine, endLine := e.cursorY, e.cursorY
+	if e.hasSelection() {
+		start, end := e.getSelectionBounds()
+		startLine, endLine = start.y, end.y
+	}
+	old := []rune(e.buffer.String())
+	lines := strings.Split(e.buffer.String(), "\n")
+	for y := startLine; y <= endLine; y++ {
+		lines[y] = prefix + lines[y]
+	}
+	newText := []rune(strings.Join(lines, "\n"))
+	op := UndoOp{
+		deleteAt:     0,
+		deleted:      old,
+		insertAt:     0,
+		inserted:     newText,
+		cursorBefore: Position{x: e.cursorX, y: e.cursorY},
+	}
+	e.buffer.Delete(0, e.buffer.Len())
+	e.buffer.Insert(0, newText)
+	e.cursorX += len(prefix)
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) unindentSelection(prefix string) {
+	startLine, endLine := e.cursorY, e.cursorY
+	if e.hasSelection() {
+		start, end := e.getSelectionBounds()
+		startLine, endLine = start.y, end.y
+	}
+	old := []rune(e.buffer.String())
+	lines := strings.Split(e.buffer.String(), "\n")
+	changed := false
+	for y := startLine; y <= endLine; y++ {
+		if strings.HasPrefix(lines[y], prefix) {
+			lines[y] = strings.TrimPrefix(lines[y], prefix)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	newText := []rune(strings.Join(lines, "\n"))
+	op := UndoOp{deleteAt: 0, deleted: old, insertAt: 0, inserted: newText, cursorBefore: Position{x: e.cursorX, y: e.cursorY}}
+	e.buffer.Delete(0, e.buffer.Len())
+	e.buffer.Insert(0, newText)
+	e.cursorX = max(0, e.cursorX-len(prefix))
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) replaceCurrentMatch() {
+	if !e.searchActive || e.savedEditorState == nil || len(e.searchMatches) == 0 || e.currentMatchIndex < 0 {
+		return
+	}
+	match := e.searchMatches[e.currentMatchIndex]
+	queryLen := len(e.buffer.Line(0))
+	if e.currentMatchIndex >= 0 && e.currentMatchIndex < len(e.searchMatchLens) {
+		queryLen = e.searchMatchLens[e.currentMatchIndex]
+	}
+	e.deactivateSearch()
+	start := e.positionOffset(match)
+	deleted := e.buffer.Slice(start, queryLen)
+	inserted := []rune(e.searchReplace)
+	op := UndoOp{deleteAt: start, deleted: deleted, insertAt: start, inserted: inserted, cursorBefore: Position{x: e.cursorX, y: e.cursorY}}
+	e.buffer.Delete(start, len(deleted))
+	e.buffer.Insert(start, inserted)
+	e.cursorX = match.x + len(inserted)
+	e.cursorY = match.y
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
+func (e *Editor) replaceAllMatches() {
+	if !e.searchActive || e.savedEditorState == nil || len(e.searchMatches) == 0 {
+		return
+	}
+	queryLen := len(e.buffer.Line(0))
+	lens := append([]int(nil), e.searchMatchLens...)
+	matches := append([]Position(nil), e.searchMatches...)
+	e.deactivateSearch()
+	old := []rune(e.buffer.String())
+	for i := len(matches) - 1; i >= 0; i-- {
+		offset := e.positionOffset(matches[i])
+		length := queryLen
+		if i < len(lens) {
+			length = lens[i]
+		}
+		e.buffer.Delete(offset, length)
+		e.buffer.Insert(offset, []rune(e.searchReplace))
+	}
+	newText := []rune(e.buffer.String())
+	op := UndoOp{deleteAt: 0, deleted: old, insertAt: 0, inserted: newText, cursorBefore: Position{x: e.cursorX, y: e.cursorY}}
+	e.recordUndo(op)
+	e.invalidateMaxLineWidth()
+}
+
 // activateSearch saves current editor state and sets up search mode
 func (e *Editor) activateSearch() {
+	if e.currentFile == "" && !e.untitled {
+		return
+	}
 	// Save current editor state including undo/redo stacks
 	e.savedEditorState = &FileState{
 		buffer:           e.buffer.Clone(),
@@ -1645,6 +2329,7 @@ func (e *Editor) activateSearch() {
 	e.scrollOffsetX = 0
 	e.scrollOffsetY = 0
 	e.searchMatches = nil
+	e.searchMatchLens = nil
 	e.currentMatchIndex = -1
 	e.clearSelection()
 	e.undoStack = nil
@@ -1672,6 +2357,7 @@ func (e *Editor) deactivateSearch() {
 	// Clear search state
 	e.searchActive = false
 	e.searchMatches = nil
+	e.searchMatchLens = nil
 	e.currentMatchIndex = -1
 	e.savedEditorState = nil
 	e.clearSelection()
@@ -1685,6 +2371,7 @@ func (e *Editor) updateSearchMatches() {
 	}
 
 	e.searchMatches = nil
+	e.searchMatchLens = nil
 	e.currentMatchIndex = -1
 
 	searchQuery := e.buffer.Line(0)
@@ -1692,9 +2379,20 @@ func (e *Editor) updateSearchMatches() {
 		return
 	}
 
-	// Convert search query to lowercase for case-insensitive search
-	queryLower := lowerRunes(searchQuery)
 	queryLen := len(searchQuery)
+	queryText := string(searchQuery)
+	var rx *regexp.Regexp
+	if e.searchRegex {
+		pattern := queryText
+		if !e.searchCaseSensitive {
+			pattern = "(?i)" + pattern
+		}
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			return
+		}
+		rx = compiled
+	}
 
 	// Search through saved editor lines
 	for y := 0; y < e.savedEditorState.buffer.LineCount(); y++ {
@@ -1702,12 +2400,28 @@ func (e *Editor) updateSearchMatches() {
 		if len(line) < queryLen {
 			continue
 		}
-		lineLower := lowerRunes(line)
-
-		// Find all occurrences in this line
+		if rx != nil {
+			lineText := string(line)
+			for _, match := range rx.FindAllStringIndex(lineText, -1) {
+				start := len([]rune(lineText[:match[0]]))
+				length := len([]rune(lineText[match[0]:match[1]]))
+				if length > 0 && (!e.searchWholeWord || isWholeWordMatch(line, start, length)) {
+					e.searchMatches = append(e.searchMatches, Position{x: start, y: y})
+					e.searchMatchLens = append(e.searchMatchLens, length)
+				}
+			}
+			continue
+		}
+		haystack := line
+		needle := searchQuery
+		if !e.searchCaseSensitive {
+			haystack = lowerRunes(line)
+			needle = lowerRunes(searchQuery)
+		}
 		for x := 0; x <= len(line)-queryLen; x++ {
-			if runeSliceEqual(lineLower[x:x+queryLen], queryLower) {
+			if runeSliceEqual(haystack[x:x+queryLen], needle) && (!e.searchWholeWord || isWholeWordMatch(line, x, queryLen)) {
 				e.searchMatches = append(e.searchMatches, Position{x: x, y: y})
+				e.searchMatchLens = append(e.searchMatchLens, queryLen)
 			}
 		}
 	}
@@ -1716,6 +2430,13 @@ func (e *Editor) updateSearchMatches() {
 	if len(e.searchMatches) > 0 {
 		e.currentMatchIndex = 0
 	}
+}
+
+func isWholeWordMatch(line []rune, start, length int) bool {
+	before := start == 0 || !isWordChar(line[start-1])
+	afterIndex := start + length
+	after := afterIndex >= len(line) || !isWordChar(line[afterIndex])
+	return before && after
 }
 
 func runeSliceEqual(a, b []rune) bool {
@@ -1800,6 +2521,24 @@ func (e *Editor) jumpToPreviousMatch() {
 	e.savedEditorState.scroll.y = clamp(e.savedEditorState.scroll.y, 0, maxScroll)
 }
 
+func (e *Editor) handleOverlayKey(sym sdl.Keycode) bool {
+	switch sym {
+	case sdl.K_ESCAPE:
+		e.closeOverlay()
+		return true
+	case sdl.K_RETURN:
+		e.executeOverlay()
+		return true
+	case sdl.K_BACKSPACE:
+		if len(e.overlayText) > 0 {
+			runes := []rune(e.overlayText)
+			e.overlayText = string(runes[:len(runes)-1])
+		}
+		return true
+	}
+	return false
+}
+
 func (e *Editor) handleEvent(event sdl.Event) {
 	switch t := event.(type) {
 	case *sdl.QuitEvent:
@@ -1811,8 +2550,13 @@ func (e *Editor) handleEvent(event sdl.Event) {
 		}
 	case *sdl.KeyboardEvent:
 		if t.Type == sdl.KEYDOWN {
+			if e.overlayActive {
+				e.handleOverlayKey(t.Keysym.Sym)
+				return
+			}
 			ctrl := (t.Keysym.Mod & sdl.KMOD_CTRL) != 0
 			shift := (t.Keysym.Mod & sdl.KMOD_SHIFT) != 0
+			alt := (t.Keysym.Mod & sdl.KMOD_ALT) != 0
 
 			// Handle Ctrl shortcuts
 			if ctrl && !shift {
@@ -1850,10 +2594,90 @@ func (e *Editor) handleEvent(event sdl.Event) {
 						fmt.Fprintf(os.Stderr, "Failed to save file: %v\n", err)
 					}
 					return
+				case sdl.K_o:
+					e.beginOverlay(overlayOpen, "Open file", "")
+					return
+				case sdl.K_n:
+					e.newUntitled()
+					return
+				case sdl.K_g:
+					e.beginOverlay(overlayGoto, "Go to line", "")
+					return
+				case sdl.K_p:
+					e.beginOverlay(overlayFilter, "Filter files", e.fileFilter)
+					return
+				case sdl.K_d:
+					e.duplicateLine()
+					return
+				case sdl.K_r:
+					e.buildFileTree()
+					return
+				case sdl.K_w:
+					e.closeCurrentTab()
+					return
+				case sdl.K_LEFTBRACKET:
+					e.unindentSelection("\t")
+					return
+				case sdl.K_RIGHTBRACKET:
+					e.indentSelection("\t")
+					return
 				case sdl.K_f:
 					// Activate search
-					if e.currentFile != "" {
-						e.activateSearch()
+					e.activateSearch()
+					return
+				}
+			}
+			if ctrl && shift {
+				switch t.Keysym.Sym {
+				case sdl.K_p:
+					e.beginOverlay(overlayCommand, "Command", "")
+					return
+				case sdl.K_n:
+					e.beginOverlay(overlayCreate, "Create file", "")
+					return
+				case sdl.K_s:
+					e.beginOverlay(overlaySaveAs, "Save as", e.currentFile)
+					return
+				case sdl.K_k:
+					e.deleteLine()
+					return
+				case sdl.K_h:
+					e.beginOverlay(overlayReplace, "Replace current match with", e.searchReplace)
+					return
+				}
+			}
+			if ctrl && t.Keysym.Sym == sdl.K_TAB {
+				if shift {
+					e.switchTab(-1)
+				} else {
+					e.switchTab(1)
+				}
+				return
+			}
+			if alt {
+				switch t.Keysym.Sym {
+				case sdl.K_UP:
+					e.moveLine(-1)
+					return
+				case sdl.K_DOWN:
+					e.moveLine(1)
+					return
+				case sdl.K_c:
+					if e.searchActive {
+						e.searchCaseSensitive = !e.searchCaseSensitive
+						e.updateSearchMatches()
+					}
+					return
+				case sdl.K_w:
+					if e.searchActive {
+						e.searchWholeWord = !e.searchWholeWord
+						e.updateSearchMatches()
+					}
+					return
+				case sdl.K_r:
+					if e.searchActive {
+						e.searchRegex = !e.searchRegex
+						e.updateSearchMatches()
 					}
 					return
 				}
@@ -1863,13 +2687,15 @@ func (e *Editor) handleEvent(event sdl.Event) {
 			if t.Keysym.Sym == sdl.K_F3 && !ctrl && !shift {
 				if !e.searchActive {
 					// Activate search if not already active
-					if e.currentFile != "" {
-						e.activateSearch()
-					}
+					e.activateSearch()
 				} else if len(e.searchMatches) > 0 {
 					// Jump to next match if we have matches
 					e.jumpToNextMatch()
 				}
+				return
+			}
+			if t.Keysym.Sym == sdl.K_F3 && shift && e.searchActive {
+				e.jumpToPreviousMatch()
 				return
 			}
 
@@ -2044,6 +2870,10 @@ func (e *Editor) handleEvent(event sdl.Event) {
 			textLength++
 		}
 		text := string(t.Text[:textLength])
+		if e.overlayActive {
+			e.overlayText += text
+			return
+		}
 
 		if e.hasSelection() {
 			e.deleteSelection()
@@ -2055,6 +2885,14 @@ func (e *Editor) handleEvent(event sdl.Event) {
 		e.ensureCursorVisible()
 	case *sdl.MouseButtonEvent:
 		if t.Type == sdl.MOUSEBUTTONDOWN && t.Button == sdl.BUTTON_LEFT {
+			if d := int(t.X) - e.fileBrowserWidth; d >= -4 && d <= 4 {
+				e.fileBrowserResizing = true
+				return
+			}
+			if t.X > int32(e.fileBrowserWidth) && t.Y < tabBarHeight {
+				e.handleTabClick(t.X)
+				return
+			}
 			// Check if click is on scrollbar
 			visibleLines := e.getVisibleLines()
 			totalLines := e.lineCount()
@@ -2071,7 +2909,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 					// Clamp
 					maxScroll := max(0, totalLines-visibleLines)
 					e.scrollOffsetY = clamp(e.scrollOffsetY, 0, maxScroll)
-				} else if t.X < fileBrowserWidth {
+				} else if t.X < int32(e.fileBrowserWidth) {
 					// Check if click is in file browser
 					e.handleFileBrowserClick(t.X, t.Y)
 				} else {
@@ -2123,7 +2961,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 
 					e.ensureCursorVisible()
 				}
-			} else if t.X < fileBrowserWidth {
+			} else if t.X < int32(e.fileBrowserWidth) {
 				// Check if click is in file browser
 				e.handleFileBrowserClick(t.X, t.Y)
 			} else {
@@ -2178,17 +3016,23 @@ func (e *Editor) handleEvent(event sdl.Event) {
 		} else if t.Type == sdl.MOUSEBUTTONUP && t.Button == sdl.BUTTON_LEFT {
 			e.mouseDown = false
 			e.scrollbarDragging = false
+			e.fileBrowserResizing = false
 			if e.selectionStart != nil && e.selectionEnd == nil {
 				// Just a click, no drag
 				e.clearSelection()
 			}
 		}
 	case *sdl.MouseMotionEvent:
+		if e.fileBrowserResizing {
+			e.fileBrowserWidth = clamp(int(t.X), 120, min(600, int(e.windowWidth)-200))
+			e.invalidateFileBrowserWidth()
+			return
+		}
 		// Update cursor appearance based on mouse position
 		scrollbarWidth := int32(8)
 		scrollbarX := e.windowWidth - scrollbarWidth - 2
 
-		if t.X >= fileBrowserWidth+gutterWidth && t.X < scrollbarX && e.currentFile != "" {
+		if t.X >= int32(e.fileBrowserWidth+gutterWidth) && t.X < scrollbarX && (e.currentFile != "" || e.untitled) {
 			// Mouse is over code area - show I-beam cursor
 			sdl.SetCursor(e.ibeamCursor)
 		} else {
@@ -2218,7 +3062,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 		// Get mouse position to determine which area to scroll
 		mouseX, _, _ := sdl.GetMouseState()
 
-		if mouseX < fileBrowserWidth {
+		if mouseX < int32(e.fileBrowserWidth) {
 			// Scroll file browser
 			// Vertical scroll
 			if t.Y > 0 {
@@ -2250,7 +3094,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 				maxWidth := e.getFileBrowserMaxWidth()
 
 				// Clamp horizontal scroll
-				maxFileBrowserScrollX := maxWidth - fileBrowserWidth + 20
+				maxFileBrowserScrollX := maxWidth - e.fileBrowserWidth + 20
 				if maxFileBrowserScrollX < 0 {
 					maxFileBrowserScrollX = 0
 				}
@@ -2283,7 +3127,7 @@ func (e *Editor) handleEvent(event sdl.Event) {
 				maxWidth := e.getMaxLineWidth()
 
 				// Calculate visible code area width
-				codeAreaWidth := int(e.windowWidth) - fileBrowserWidth - gutterWidth
+				codeAreaWidth := int(e.windowWidth) - e.fileBrowserWidth - gutterWidth
 				maxScrollX := maxWidth - codeAreaWidth + 20 // +20 for padding
 				if maxScrollX < 0 {
 					maxScrollX = 0
@@ -2299,6 +3143,172 @@ func (e *Editor) handleEvent(event sdl.Event) {
 			}
 		}
 		// Don't call ensureCursorVisible here - allow free scrolling
+	case *sdl.DropEvent:
+		if t.Type == sdl.DROPFILE && t.File != "" {
+			info, err := os.Stat(t.File)
+			if err == nil && info.IsDir() {
+				e.rootDir = t.File
+				e.stateDir = filepath.Join(e.rootDir, ".rune")
+				_ = os.MkdirAll(filepath.Join(e.stateDir, "autosave"), 0755)
+				e.openFiles = nil
+				e.fileStates = make(map[string]*FileState)
+				e.currentFile = ""
+				e.untitled = false
+				e.buffer = NewPieceTable("")
+				e.buildFileTree()
+				e.saveSession()
+			} else if err == nil {
+				_ = e.loadFile(t.File)
+			}
+		}
+	}
+}
+
+func (e *Editor) handleTabClick(x int32) {
+	tabX := int32(e.fileBrowserWidth + 4)
+	for _, path := range e.openFiles {
+		name := filepath.Base(path)
+		if e.fileDirty(path) {
+			name += " *"
+		}
+		w := int32(max(80, len([]rune(name))*e.charWidth+18))
+		if x >= tabX && x <= tabX+w {
+			_ = e.loadFile(path)
+			return
+		}
+		tabX += w + 3
+	}
+}
+
+func keywordColor(word string) sdl.Color {
+	switch word {
+	case "break", "case", "catch", "class", "const", "continue", "def", "default", "defer", "del", "else", "enum", "export", "extends", "false", "finally", "for", "func", "function", "go", "if", "import", "in", "interface", "let", "map", "match", "new", "nil", "null", "package", "pass", "return", "struct", "switch", "this", "throw", "true", "try", "type", "var", "while":
+		return sdl.Color{R: 110, G: 170, B: 230, A: 255}
+	}
+	return sdl.Color{R: 200, G: 200, B: 200, A: 255}
+}
+
+func (e *Editor) renderHighlightedLine(line []rune, x, y int32, scrollX int) {
+	col := int32(0)
+	for i := 0; i < len(line); {
+		start := i
+		color := sdl.Color{R: 200, G: 200, B: 200, A: 255}
+		switch {
+		case i+1 < len(line) && line[i] == '/' && line[i+1] == '/':
+			i = len(line)
+			color = sdl.Color{R: 120, G: 150, B: 120, A: 255}
+		case line[i] == '#':
+			i = len(line)
+			color = sdl.Color{R: 120, G: 150, B: 120, A: 255}
+		case line[i] == '"' || line[i] == '\'':
+			quote := line[i]
+			i++
+			for i < len(line) {
+				if line[i] == '\\' && i+1 < len(line) {
+					i += 2
+					continue
+				}
+				if line[i] == quote {
+					i++
+					break
+				}
+				i++
+			}
+			color = sdl.Color{R: 210, G: 170, B: 110, A: 255}
+		case unicode.IsDigit(line[i]):
+			for i < len(line) && (unicode.IsDigit(line[i]) || line[i] == '.') {
+				i++
+			}
+			color = sdl.Color{R: 190, G: 150, B: 220, A: 255}
+		case isWordChar(line[i]):
+			for i < len(line) && isWordChar(line[i]) {
+				i++
+			}
+			color = keywordColor(string(line[start:i]))
+		default:
+			i++
+		}
+		text := expandTabsForDisplay(line[start:i], tabWidth)
+		if text == "" {
+			continue
+		}
+		cached, err := e.cachedText(text, color)
+		if err == nil {
+			dstX := x + col - int32(scrollX)
+			if dstX+cached.w > x {
+				e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: dstX, Y: y, W: cached.w, H: cached.h})
+			}
+			col += int32(displayColumn(line[start:i], len(line[start:i])) * e.charWidth)
+		}
+	}
+}
+
+func (e *Editor) renderTabBar() {
+	x := int32(e.fileBrowserWidth)
+	e.renderer.SetDrawColor(22, 22, 22, 255)
+	e.renderer.FillRect(&sdl.Rect{X: x, Y: 0, W: e.windowWidth - x, H: tabBarHeight})
+	tabX := x + 4
+	for _, path := range e.openFiles {
+		name := filepath.Base(path)
+		if e.fileDirty(path) {
+			name += " *"
+		}
+		active := path == e.currentFile
+		if active {
+			e.renderer.SetDrawColor(45, 55, 65, 255)
+		} else {
+			e.renderer.SetDrawColor(30, 30, 30, 255)
+		}
+		w := int32(max(80, len([]rune(name))*e.charWidth+18))
+		e.renderer.FillRect(&sdl.Rect{X: tabX, Y: 2, W: w, H: tabBarHeight - 4})
+		cached, err := e.cachedText(name, sdl.Color{R: 190, G: 190, B: 190, A: 255})
+		if err == nil {
+			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: tabX + 8, Y: 4, W: cached.w, H: cached.h})
+		}
+		tabX += w + 3
+	}
+	if e.untitled {
+		name := e.untitledName + " *"
+		e.renderer.SetDrawColor(45, 55, 65, 255)
+		w := int32(max(90, len([]rune(name))*e.charWidth+18))
+		e.renderer.FillRect(&sdl.Rect{X: tabX, Y: 2, W: w, H: tabBarHeight - 4})
+		cached, err := e.cachedText(name, sdl.Color{R: 190, G: 190, B: 190, A: 255})
+		if err == nil {
+			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: tabX + 8, Y: 4, W: cached.w, H: cached.h})
+		}
+	}
+}
+
+func (e *Editor) renderOverlay() {
+	if !e.overlayActive {
+		return
+	}
+	w := int32(520)
+	h := int32(96)
+	x := (e.windowWidth - w) / 2
+	y := int32(48)
+	e.renderer.SetDrawColor(28, 28, 28, 245)
+	e.renderer.FillRect(&sdl.Rect{X: x, Y: y, W: w, H: h})
+	e.renderer.SetDrawColor(90, 90, 90, 255)
+	e.renderer.DrawRect(&sdl.Rect{X: x, Y: y, W: w, H: h})
+	if cached, err := e.cachedText(e.overlayTitle, sdl.Color{R: 180, G: 180, B: 180, A: 255}); err == nil {
+		e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: x + 12, Y: y + 10, W: cached.w, H: cached.h})
+	}
+	input := e.overlayText
+	if input == "" {
+		input = " "
+	}
+	if cached, err := e.cachedText(input, sdl.Color{R: 235, G: 235, B: 235, A: 255}); err == nil {
+		e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: x + 12, Y: y + 42, W: cached.w, H: cached.h})
+		cursorX := x + 12 + int32(len([]rune(e.overlayText))*e.charWidth)
+		e.renderer.SetDrawColor(235, 235, 235, 255)
+		e.renderer.FillRect(&sdl.Rect{X: cursorX, Y: y + 40, W: 2, H: lineHeight})
+	}
+	if e.overlayMode == overlayCommand {
+		hint := "new open create rename delete goto find replace replace all filter refresh save save as next tab previous tab close tab"
+		if cached, err := e.cachedText(hint, sdl.Color{R: 120, G: 120, B: 120, A: 255}); err == nil {
+			e.renderer.Copy(cached.texture, nil, &sdl.Rect{X: x + 12, Y: y + 70, W: cached.w, H: cached.h})
+		}
 	}
 }
 
@@ -2309,8 +3319,8 @@ func (e *Editor) renderSearchBox() {
 	}
 
 	searchBoxHeight := int32(30)
-	searchBoxY := int32(0)
-	codeAreaX := int32(fileBrowserWidth)
+	searchBoxY := int32(tabBarHeight)
+	codeAreaX := int32(e.fileBrowserWidth)
 
 	// Render search box background
 	e.renderer.SetDrawColor(30, 30, 30, 255)
@@ -2398,6 +3408,19 @@ func (e *Editor) renderSearchBox() {
 		} else {
 			matchText = fmt.Sprintf("%d of %d", e.currentMatchIndex+1, len(e.searchMatches))
 		}
+		flags := []string{}
+		if e.searchCaseSensitive {
+			flags = append(flags, "case")
+		}
+		if e.searchWholeWord {
+			flags = append(flags, "word")
+		}
+		if e.searchRegex {
+			flags = append(flags, "regex")
+		}
+		if len(flags) > 0 {
+			matchText += "  " + strings.Join(flags, " ")
+		}
 		matchCached, err := e.cachedText(matchText, sdl.Color{R: 150, G: 150, B: 150, A: 255})
 		if err == nil {
 			matchRect := &sdl.Rect{
@@ -2420,8 +3443,8 @@ func (e *Editor) renderWelcomeScreen() {
 	cached, err := e.cachedText(welcomeMsg, sdl.Color{R: 150, G: 150, B: 150, A: 255})
 	if err == nil {
 		// Center the text in the code area
-		codeAreaWidth := e.windowWidth - fileBrowserWidth
-		textX := fileBrowserWidth + (codeAreaWidth-cached.w)/2
+		codeAreaWidth := e.windowWidth - int32(e.fileBrowserWidth)
+		textX := int32(e.fileBrowserWidth) + (codeAreaWidth-cached.w)/2
 		textY := (e.windowHeight - cached.h) / 2
 
 		rect := &sdl.Rect{X: textX, Y: textY, W: cached.w, H: cached.h}
@@ -2435,21 +3458,25 @@ func (e *Editor) render() {
 	if e.currentFile != "" {
 		fileName := filepath.Base(e.currentFile)
 		title = fileName + " | " + programName
+	} else if e.untitled {
+		title = e.untitledName + " | " + programName
 	}
 	e.window.SetTitle(title)
 
 	e.renderer.SetDrawColor(15, 15, 15, 255)
 	e.renderer.Clear()
 
-	codeAreaX := int32(fileBrowserWidth)
+	codeAreaX := int32(e.fileBrowserWidth)
 	searchBoxHeight := int32(0)
 	if e.searchActive {
 		searchBoxHeight = 30
 	}
+	codeTop := int32(tabBarHeight) + searchBoxHeight
 
 	// If no file is open, show welcome screen
-	if e.currentFile == "" {
+	if e.currentFile == "" && !e.untitled {
 		e.renderWelcomeScreen()
+		e.renderOverlay()
 		e.renderer.Present()
 		return
 	}
@@ -2477,6 +3504,7 @@ func (e *Editor) render() {
 
 	// Render file browser
 	e.renderFileBrowser()
+	e.renderTabBar()
 
 	// Render current line highlight (only for saved state when searching, not for search box)
 	if e.searchActive && e.savedEditorState != nil {
@@ -2486,7 +3514,7 @@ func (e *Editor) render() {
 			e.renderer.SetDrawColor(40, 40, 40, 255)
 			e.renderer.FillRect(&sdl.Rect{
 				X: codeAreaX,
-				Y: int32(screenY) + searchBoxHeight,
+				Y: int32(screenY) + codeTop,
 				W: e.windowWidth - codeAreaX,
 				H: lineHeight,
 			})
@@ -2496,7 +3524,7 @@ func (e *Editor) render() {
 		e.renderer.SetDrawColor(40, 40, 40, 255)
 		e.renderer.FillRect(&sdl.Rect{
 			X: codeAreaX,
-			Y: int32(screenY) + searchBoxHeight,
+			Y: int32(screenY) + codeTop,
 			W: e.windowWidth - codeAreaX,
 			H: lineHeight,
 		})
@@ -2505,9 +3533,9 @@ func (e *Editor) render() {
 	// Set clip rect for code area to prevent overflow (below search box)
 	codeClipRect := &sdl.Rect{
 		X: codeAreaX,
-		Y: searchBoxHeight,
+		Y: codeTop,
 		W: e.windowWidth - codeAreaX,
-		H: e.windowHeight - searchBoxHeight,
+		H: e.windowHeight - codeTop,
 	}
 	e.renderer.SetClipRect(codeClipRect)
 
@@ -2520,20 +3548,20 @@ func (e *Editor) render() {
 		}
 
 		screenY := (y - renderScrollY) * lineHeight
-		rect := &sdl.Rect{X: codeAreaX + int32(gutterWidth-cached.w-10), Y: int32(screenY) + searchBoxHeight, W: cached.w, H: cached.h}
+		rect := &sdl.Rect{X: codeAreaX + int32(gutterWidth-cached.w-10), Y: int32(screenY) + codeTop, W: cached.w, H: cached.h}
 		e.renderer.Copy(cached.texture, nil, rect)
 	}
 
 	// Render gutter separator
 	e.renderer.SetDrawColor(50, 50, 50, 255)
-	e.renderer.DrawLine(codeAreaX+gutterWidth-5, searchBoxHeight, codeAreaX+gutterWidth-5, e.windowHeight)
+	e.renderer.DrawLine(codeAreaX+gutterWidth-5, codeTop, codeAreaX+gutterWidth-5, e.windowHeight)
 
 	// Update clip rect to exclude gutter - only clip text area
 	textAreaClipRect := &sdl.Rect{
 		X: codeAreaX + gutterWidth,
-		Y: searchBoxHeight,
+		Y: codeTop,
 		W: e.windowWidth - codeAreaX - gutterWidth,
-		H: e.windowHeight - searchBoxHeight,
+		H: e.windowHeight - codeTop,
 	}
 	e.renderer.SetClipRect(textAreaClipRect)
 
@@ -2555,7 +3583,7 @@ func (e *Editor) render() {
 				screenY := (start.y - renderScrollY) * lineHeight
 				e.renderer.FillRect(&sdl.Rect{
 					X: codeAreaX + int32(gutterWidth+startW-renderScrollX),
-					Y: int32(screenY) + searchBoxHeight,
+					Y: int32(screenY) + codeTop,
 					W: int32(selectedW),
 					H: lineHeight,
 				})
@@ -2570,7 +3598,7 @@ func (e *Editor) render() {
 				screenY := (start.y - renderScrollY) * lineHeight
 				e.renderer.FillRect(&sdl.Rect{
 					X: codeAreaX + int32(gutterWidth+startW-renderScrollX),
-					Y: int32(screenY) + searchBoxHeight,
+					Y: int32(screenY) + codeTop,
 					W: int32(restW),
 					H: lineHeight,
 				})
@@ -2583,7 +3611,7 @@ func (e *Editor) render() {
 					screenY := (y - renderScrollY) * lineHeight
 					e.renderer.FillRect(&sdl.Rect{
 						X: codeAreaX + int32(gutterWidth-renderScrollX),
-						Y: int32(screenY) + searchBoxHeight,
+						Y: int32(screenY) + codeTop,
 						W: int32(w),
 						H: lineHeight,
 					})
@@ -2596,7 +3624,7 @@ func (e *Editor) render() {
 				screenY := (end.y - renderScrollY) * lineHeight
 				e.renderer.FillRect(&sdl.Rect{
 					X: codeAreaX + int32(gutterWidth-renderScrollX),
-					Y: int32(screenY) + searchBoxHeight,
+					Y: int32(screenY) + codeTop,
 					W: int32(endW),
 					H: lineHeight,
 				})
@@ -2607,9 +3635,12 @@ func (e *Editor) render() {
 	// Render search match highlights
 	searchQuery := e.buffer.Line(0)
 	if e.searchActive && len(e.searchMatches) > 0 && len(searchQuery) > 0 {
-		queryLen := len(searchQuery)
 		for _, matchIndex := range e.visibleSearchMatchIndexes(startLine, endLine) {
 			match := e.searchMatches[matchIndex]
+			queryLen := len(searchQuery)
+			if matchIndex < len(e.searchMatchLens) {
+				queryLen = e.searchMatchLens[matchIndex]
+			}
 			// Only render matches in visible lines
 			if match.y >= startLine && match.y < endLine {
 				line := renderBuffer.Line(match.y)
@@ -2628,7 +3659,7 @@ func (e *Editor) render() {
 
 				e.renderer.FillRect(&sdl.Rect{
 					X: codeAreaX + int32(gutterWidth+startW-renderScrollX),
-					Y: int32(screenY) + searchBoxHeight,
+					Y: int32(screenY) + codeTop,
 					W: int32(matchW),
 					H: lineHeight,
 				})
@@ -2642,36 +3673,8 @@ func (e *Editor) render() {
 		if len(line) == 0 {
 			continue
 		}
-		// Expand tabs to spaces for rendering only
-		text := expandTabsForDisplay(line, tabWidth)
-		cached, err := e.cachedText(text, sdl.Color{R: 200, G: 200, B: 200, A: 255})
-		if err != nil {
-			continue
-		}
-
 		screenY := (y - renderScrollY) * lineHeight
-
-		// Calculate source rect based on horizontal scroll
-		srcRect := &sdl.Rect{
-			X: int32(renderScrollX),
-			Y: 0,
-			W: cached.w - int32(renderScrollX),
-			H: cached.h,
-		}
-
-		// Don't render if scrolled past the entire line
-		if srcRect.W <= 0 {
-			continue
-		}
-
-		dstRect := &sdl.Rect{
-			X: codeAreaX + int32(gutterWidth),
-			Y: int32(screenY) + searchBoxHeight,
-			W: srcRect.W,
-			H: cached.h,
-		}
-
-		e.renderer.Copy(cached.texture, srcRect, dstRect)
+		e.renderHighlightedLine(line, codeAreaX+int32(gutterWidth), int32(screenY)+codeTop, renderScrollX)
 	}
 
 	// Render cursor in code area (only if not searching)
@@ -2685,7 +3688,7 @@ func (e *Editor) render() {
 		cursorX := codeAreaX + int32(gutterWidth+cursorPixelX-renderScrollX) - 1
 
 		e.renderer.SetDrawColor(255, 255, 255, 255)
-		e.renderer.FillRect(&sdl.Rect{X: cursorX, Y: int32(cursorY) + searchBoxHeight, W: 2, H: fontSize})
+		e.renderer.FillRect(&sdl.Rect{X: cursorX, Y: int32(cursorY) + codeTop, W: 2, H: fontSize})
 	}
 
 	// Clear clip rect
@@ -2693,6 +3696,7 @@ func (e *Editor) render() {
 
 	// Render search box on top
 	e.renderSearchBox()
+	e.renderOverlay()
 
 	// Render scrollbar (only if needed)
 	totalLines := renderBuffer.LineCount()
@@ -2743,6 +3747,7 @@ func (e *Editor) run() {
 }
 
 func (e *Editor) cleanup() {
+	e.saveSession()
 	// Note: SDL cursors are freed automatically, no need to destroy them
 	for _, cached := range e.textCache {
 		if cached.texture != nil {
@@ -2759,47 +3764,15 @@ func (e *Editor) cleanup() {
 func main() {
 	runtime.LockOSThread()
 
-	// Check if we're running detached already
-	isDetached := false
 	var targetPath string
 
 	// Parse arguments
 	args := os.Args[1:]
 	for i, arg := range args {
-		if arg == "--detached" {
-			isDetached = true
-		} else if i == len(args)-1 {
+		if arg != "--detached" && i == len(args)-1 {
 			// Last non-flag argument is the target path
 			targetPath = arg
 		}
-	}
-
-	// If configured for this platform, re-execute ourselves in detached mode.
-	if !isDetached && shouldAutoDetach() {
-		exe, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build arguments for detached process
-		detachedArgs := []string{"--detached"}
-		if targetPath != "" {
-			detachedArgs = append(detachedArgs, targetPath)
-		}
-
-		cmd := exec.Command(exe, detachedArgs...)
-		configureDetachedCommand(cmd)
-
-		// Start the detached process
-		err = cmd.Start()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start detached process: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Parent process exits immediately
-		return
 	}
 
 	editor, err := NewEditor(targetPath)
